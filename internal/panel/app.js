@@ -1266,6 +1266,7 @@ const CFG_MAP = {
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   blackcat_hours: ['schedule', 'blackcat_hours'], blackcat_enabled: ['schedule', 'blackcat_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
+  keepalive_refresh_window: ['schedule', 'keepalive_refresh_window'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   account_spread_minutes: ['schedule', 'account_spread_minutes'], account_spread_min_gap_seconds: ['schedule', 'account_spread_min_gap_seconds'],
@@ -1363,7 +1364,8 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'keepalive_refresh_window'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
@@ -1676,6 +1678,10 @@ const AUTO_TASKS = {
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
   'WorkBuddy_Valorant': '真实「无畏契约拼豆专家」召唤+使用链（真实对话 requestId，截止 11-15）',
+  'expert_use_maidehao': '「中国电商运营专家」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
+  'expert_use_douyinyin': '「抖音策略师」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
+  'expert_use_shangjia_xuanchuan': '「商家宣传页与海报设计师」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
+  'expert_use_bowangwang': '「直播电商教练」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
   'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
   'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）',
   'Sequential_Tasks_2': '小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 领奖（+200c+5e）',

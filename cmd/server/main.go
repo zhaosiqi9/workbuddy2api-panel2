@@ -229,6 +229,8 @@ func main() {
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		// 周期保活只刷新临期凭证（默认 7 天窗口）；面板手动全量保活不受影响。
+		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 		JitterMinutes:          cfg.Schedule.JitterMinutes,
@@ -709,6 +711,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring, newCfg.ExpiringSoonDur)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
+	sch.SetKeepaliveRefreshWindow(newCfg.KeepaliveRefreshWindowDur)
 	p.SetReserveCredits(*newCfg.Pool.ReserveCredits)  // 保留积分热生效（0 = 关闭，缺省 10）
 	p.SetAccountPriority(newCfg.Pool.AccountPriority) // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)

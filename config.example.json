@@ -25,6 +25,7 @@
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
+    "keepalive_refresh_window": "168h",
     "blackcat_hours": [23],
     "growth_hours": [11],
     "checkin_enabled": true,

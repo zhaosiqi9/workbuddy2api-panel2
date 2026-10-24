@@ -435,6 +435,26 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	return uids
 }
 
+// CapacityForModel reports healthy accounts for model and across the pool.
+// In-flight requests are intentionally ignored because request admission is
+// handled independently by the caller.
+func (p *Pool) CapacityForModel(model, realm string) (modelAvailable, poolAvailable int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	for _, e := range p.byUID {
+		if e.healthy(now) {
+			poolAvailable++
+		}
+		if (realm == "" || e.a.Realm() == realm) && e.healthyForModel(now, model) &&
+			!p.floorBlockedForRealmModel(e, model, realm, now) {
+			modelAvailable++
+		}
+	}
+	return modelAvailable, poolAvailable
+}
+
 // PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
 // 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，

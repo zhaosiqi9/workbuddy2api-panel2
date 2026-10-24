@@ -420,7 +420,8 @@ curl -s http://localhost:7863/v1/responses \
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
 | `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖） |
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
-| `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
+| `schedule.keepalive_hours` | `[22]` | 每日本地时区整点触发周期 token 保活；仅刷新临近窗口内的凭证 |
+| `schedule.keepalive_refresh_window` | `168h` | 周期保活的临期窗口；剩余有效期不超过该时长才刷新，已过期/无 expiry 仍刷新；面板「全部保活」手动入口仍全量刷新 |
 | `schedule.blackcat_hours` | `[23]` | 每日本地时区整点夜猫子补足（23:00–08:00 计数窗口） |
 | `schedule.growth_hours` | `[11]` | 每日本地时区整点自动跑一遍**成长任务队列**（任务中心待办：扫描 → accept → 动作 → 达标领奖） |
 | `schedule.growth_concurrency` | `1` | 排程轮次的账号间并发（1-4，>4 启动报错）；越高越快，上游风控暴露面越大 |
