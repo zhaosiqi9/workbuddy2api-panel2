@@ -16,14 +16,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: main
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Add upstream remote
         run: |
+          git remote remove upstream || true
           git remote add upstream https://github.com/misakano7545/workbuddy2api-panel.git
-          git fetch upstream
+          git fetch upstream --prune
 
-      - name: Sync with upstream
+      - name: Sync fork with upstream while preserving local changes
         run: |
           git checkout main
-          git merge --ff-only upstream/main
+          git fetch origin
+          git merge --no-edit upstream/main || {
+            echo "::error::Merge conflict detected while syncing upstream. Local changes are preserved."
+            git status --short
+            exit 1
+          }
           git push origin main
