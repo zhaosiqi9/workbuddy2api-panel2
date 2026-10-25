@@ -1471,8 +1471,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 只能手动催一句。此前网关侧完全无痕（这是定位困难的主因），这里只记日志
 			// 并非把流改成错误：模型「判断不需要工具、直接回答」是合法行为，强行改写成
 			// 错误会让这类正常回合反复重试、每次都真实计费。
+			//
+			// 级别是 INFO 不是 WARN：这是合法收尾，不是故障。记 WARN 会进「错误汇总」
+			// 的兜底桶（其他（未归类）），把正常回合当成错误看待。
 			if len(declaredTools) > 0 && !stats.SawToolCalls() && stats.FinishReason() == "stop" {
-				log.Printf("WARN: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (silent stop; client may treat the turn as complete)",
+				log.Printf("INFO: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (本轮无工具调用，正常收尾)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools))
 			}
 			st.ttfb = stats.TTFB()
@@ -1961,9 +1964,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			//
 			// 代价：每个网关 401 多一次 refresh 往返；refresh 轻量且 401 低频，另由下面
 			// 的软冷却兜住「同一账号每请求都来问一次」。
-			if acct := h.cfg.Pool.AuthByUID(uid); acct != nil && acct.RefreshTokenValue() != "" && h.cfg.Upstream != nil {
-				rerr := h.cfg.Upstream.RefreshToken(acct)
-				if rerr == nil {
+			if acct := h.cfg.Pool.AuthByUID(uid); acct != nil && h.cfg.Upstream != nil {
+				switch h.cfg.Upstream.VerifySessionByRefresh(acct) {
+				case upstream.VerifyAlive:
 					// 上游已轮换 RT：必须落盘，否则重启拿旧 RT 刷新 = 账号真死。
 					if serr := acct.SaveAtomicRetry(); serr != nil {
 						log.Printf("ERR: [server] 网关 401 后 refresh 成功但落盘失败: %v", serr)
@@ -1976,26 +1979,26 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 					log.Printf("INFO: [server] 账号 %s 网关 401 但 refresh 成功 → 瞬时拦截，不计 session dead",
 						logfmt.Label(uid, ""))
 					return
-				}
-				// 只有上游**应用层明确拒绝**才算 token 失效。refresh 端点同样挂在
-				// /v2/* 上，边缘瞬时拦截时它也回 HTML 页（401/403 无业务信封）——
-				// 那是「拦截」不是「判词」，计入就等于换个地方复发同一个误杀。
-				var re *upstream.Error
-				if !errors.As(rerr, &re) || re.Status >= 500 || re.Status == http.StatusTooManyRequests ||
-					upstream.IsGatewayUnauthorized(re.Status, re.Msg) || upstream.IsWafBlocked(re.Status, re.Msg) {
+				case upstream.VerifyInconclusive:
+					// refresh 未给出明确判词（网络/5xx/429/refresh 端点自身被拦）：
+					// 既不能判活也不能判死，只短退避。判死会在同一层再误杀一次。
 					h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (refresh inconclusive)")
-					log.Printf("INFO: [server] 账号 %s 网关 401，refresh 未给出明确判词 → 不计 session dead: %v",
-						logfmt.Label(uid, ""), rerr)
+					log.Printf("INFO: [server] 账号 %s 网关 401，refresh 未给出明确判词 → 不计 session dead",
+						logfmt.Label(uid, ""))
 					return
 				}
+				// VerifyDead：落到下面的计死逻辑。
 			}
-			if h.cfg.Pool.NoteSessionDeadWith(uid, gatewayUnauthorizedReason) {
-				log.Printf("WARN: [server] 账号 %s 连续 %d 次网关 401 且 refresh 判死 → 禁用，需重新登录",
+			// reason 带上「次数 + 已 refresh 验证」两个事实：面板只显示这一行，
+			// 运维要能一眼判断是「刚发生」还是「反复出现」，以及「是否已排除网关抖动」。
+			if h.cfg.Pool.NoteSessionDeadWith(uid, fmt.Sprintf(
+				"网关 401 × %d 且 refresh 验证失败（token 已确认失效）", pool.SessionDeadThreshold())) {
+				log.Printf("WARN: [server] 账号 %s 连续 %d 次网关 401 且 refresh 失败（token 确实失效）→ 禁用，需重新登录",
 					logfmt.Label(uid, ""), pool.SessionDeadThreshold())
 			}
 			return
 		}
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		h.cfg.Pool.Disable(uid, "上游 12153 session dead（业务码明说登录态失效，需重新登录）")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

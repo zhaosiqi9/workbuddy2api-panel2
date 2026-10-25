@@ -302,6 +302,18 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .rate-limit span { color: var(--ink-2); }
 .acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+/* 表格里的操作列是 <td class="acts">：上面的 display:flex 会把 td 踢出表格布局，
+   导致 vertical-align:middle 失效（按钮整体偏上、行线不齐）。这里强制恢复
+   table-cell，让该列和其他列一样参与行高与垂直居中；按钮排列交给内层 .acts-inner。 */
+td.acts { display: table-cell; vertical-align: middle; text-align: right; }
+/* 账号池操作列：每个动作占固定槽位（签到 / 余额 / 任务 / 选号 / 禁用 / 移除），
+   缺哪个留空槽。否则「解冻 / 暂停选号 / 恢复选号」互斥会改变按钮个数，整列左右错位。
+   分列放在内层 div：td 保持 table-cell，vertical-align:middle 才继续生效
+   （直接给 td 设 display:grid 会退出表格布局，按钮变顶对齐）。 */
+.acts-inner { display: grid; grid-template-columns: repeat(4, 54px) 68px repeat(2, 54px); gap: 5px; justify-content: end; align-items: center; }
+/* 统一盒模型：primary 与 ghost 的边框/行高不同会让「解冻」行比「暂停选号」行高 2~3px，
+   行线因此参差。固定高度 + border-box 后每行等高、按钮底边对齐。 */
+.acts-inner button { width: 100%; height: 26px; box-sizing: border-box; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 .empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
@@ -812,6 +824,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>成长任务 <span class="hint" id="tcSummary"></span></h3>
           <span class="grow"></span>
+          <label class="sel-note" title="隐藏状态为「完成」的任务行"><input type="checkbox" id="tcHideDone" checked> 隐藏已完成</label>
+          <label class="sel-note" title="隐藏「该账号没有此任务」的任务行"><input type="checkbox" id="tcHideNa" checked> 隐藏不适用</label>
           <label class="sel-note">并发
             <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
           </label>
@@ -1484,11 +1498,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div id="addTabLogin" class="tab-panel">
         <div id="addPick">
           <div class="realm-row">
-            <span class="hint" style="font-size:12px">版本：</span>
-            <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
-            <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
+            <span class="hint" style="font-size:12px">站点：</span>
+            <label class="realm-opt"><input type="radio" name="addSite" value="cn" checked> 国内版（CN）</label>
+            <label class="realm-opt"><input type="radio" name="addSite" value="intl"> 国际版（Global）</label>
+            <label class="realm-opt"><input type="radio" name="addSite" value="workbuddy"> 国际版（旧桌面端）</label>
           </div>
-          <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
+          <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。「旧桌面端」仅用于已注册在 workbuddy.ai 的老账号，新账号请选国际版。</div>
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>

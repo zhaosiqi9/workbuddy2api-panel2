@@ -299,6 +299,54 @@ function rateLimitMeta(row, now) {
   }
   return { model, kind, detail, title: title.join('\n') };
 }
+// disabledKind 把禁用 reason 归成「类别 + 语气 + 建议动作」。
+//
+// 为什么要分类而不是直接显示 reason：四种禁用成因的**处置方式完全不同** ——
+// 上游封禁要申诉、登录失效要重登、手动禁用要人来判断、12153 也是重登。
+// 只甩一行原始文本，运维得先读懂才敢动手；分成标签后「该做什么」一眼可见。
+// 判据按**优先级**匹配：11140/封禁类先判（最严重且处置唯一），再判登录失效。
+function disabledKind(reason) {
+  const r = String(reason || '').toLowerCase();
+  if (/11140|banned|restricted|request illegal/.test(r)) {
+    return { label: '上游封禁', tone: 'bad', action: '需在官方申诉，revive 无效' };
+  }
+  if (/refresh.*失败|refresh 验证失败/.test(r)) {
+    return { label: '登录失效', tone: 'bad', action: '需重新登录' };
+  }
+  if (/12153/.test(r)) {
+    return { label: '登录失效', tone: 'bad', action: '需重新登录' };
+  }
+  if (/401/.test(r)) {
+    return { label: '鉴权失败', tone: 'warn', action: '确认后重登或恢复' };
+  }
+  if (/manual|手动/.test(r)) {
+    return { label: '手动禁用', tone: 'warn', action: '随时可恢复' };
+  }
+  return { label: '已禁用', tone: 'warn', action: '' };
+}
+
+// acctStateOf 按 uid 从 overview 快照里取账号状态（禁用/暂停）。
+//
+// 为什么余额趋势要标：这张表每一行是一条**历史余额曲线**，它不会因为账号被封
+// 而消失——但读者不知道「这条线为什么从某天起不再更新」，会把「号被封了」误读成
+// 「这段时间没怎么用」。标出来才对得上。
+function acctStateOf(uid) {
+  const list = (overviewData && overviewData.accounts) || [];
+  return list.find(a => a && a.uid === uid) || null;
+}
+
+// disabledAge 禁用时长（「刚禁”和「禁了一周」处置优先级差很远）。
+function disabledAge(at) {
+  if (!at) return '';
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) return '';
+  const sec = Math.max(0, (Date.now() - t) / 1000);
+  if (sec < 60) return '刚刚';
+  if (sec < 3600) return Math.floor(sec / 60) + ' 分钟前';
+  if (sec < 86400) return Math.floor(sec / 3600) + ' 小时前';
+  return Math.floor(sec / 86400) + ' 天前';
+}
+
 function rateLimitRowsHtml(rows, now) {
   const list = Array.isArray(rows) ? rows.filter(row => row && row.model) : [];
   if (!list.length) return '';
@@ -435,7 +483,17 @@ function renderAccounts(list) {
     // 此前这种中间态完全不可见，面板照样打「可用」（issue #215 复盘）。
     else if (s.session_dead_fails > 0) { cls = 'cool'; tag = '<span class="tag warn">疑似登录失效 · 待重登</span>'; }
     else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
-    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    // 禁用原因分两行：类别+时长（谁来处置、多久了）/ 原始 reason（细节）。
+    // 不分行的话「上游封禁 · 3 天前」和一段长 reason 挤在同一行，扫视时读不出重点。
+    const dk = s.disabled ? disabledKind(s.reason) : null;
+    const dAge = s.disabled ? disabledAge(s.disabled_at) : '';
+    const note = s.reason
+      ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' +
+        (dk ? '<span class="tag ' + dk.tone + '" style="margin-right:6px">' + esc(dk.label) + '</span>' : '') +
+        (dAge ? '<span style="margin-right:6px">' + esc(dAge) + '</span>' : '') +
+        (dk && dk.action ? '<span>' + esc(dk.action) + '</span>' : '') +
+        '<div style="margin-top:2px;opacity:.85">' + esc(s.reason) + '</div></div>'
+      : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
@@ -485,21 +543,26 @@ function renderAccounts(list) {
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
-      '<td class="acts">' +
+      '<td class="acts"><div class="acts-inner">' + [
         // 无个人成长体系的账号（企业版 / 静态 API Key）不渲染「签到」「任务」：前者
         // 上游 400「企业账号不支持该操作」，后者 403 growth-only；只留「额度」，点它走
         // /balance，额度由 upstream 的企业口径端点（get-enterprise-user-usage）填充。
+        // 七个动作按固定槽位输出，缺位留空 span —— CSS 用 grid 固定列宽，逐行对齐。
+        // 「探活」单独占一槽（仅封禁态渲染）：它与「解冻」是两个独立动作，若挤在同一
+        // 槽里输出两个按钮，冻结行的列数就与其它行不同，整列又会错位。
         (personal ?
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' : '') +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' : ''),
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>',
         (personal ?
-          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' : '') +
+          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' : ''),
+        (frozen ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探测上游是否已解封：不 revive、不参与选号、不改任何状态">探活</button>' : ''),
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (personal ? '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额' : '退出选号，但照常保活 / 刷新额度') + '">暂停选号</button>')) +
-        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
-        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
-      '</td></tr>';
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (personal ? '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额' : '退出选号，但照常保活 / 刷新额度') + '">暂停选号</button>')),
+        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>'),
+        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>',
+      ].map(html => html || '<span class="slot" aria-hidden="true"></span>').join('') +
+      '</div></td></tr>';
   }).join('');
 }
 
@@ -576,6 +639,21 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+    } else if (a === 'probe_ban') {
+      // 只读探测：后端不改任何池状态，所以这里**不刷新** overview（没有变化）。
+      // 结论用 toast 说清处置动作，而不是只报一句「仍被封」——运维要知道下一步做什么。
+      const r = await api('accounts/' + encodeURIComponent(u) + '/probe_ban', { method: 'POST' });
+      const map = {
+        lifted: ['已解封，可以点「解冻」恢复使用', 'ok'],
+        still_banned: ['仍被封禁，继续等待（勿反复 revive，可能加重风控）', 'warn'],
+        blocked: ['会话仍有效，但被上游风控拦截（可能仍是封禁）—— 继续观察', 'warn'],
+        session_dead: ['不是封禁问题 —— 登录态失效，需重新登录', 'warn'],
+        inconclusive: ['探测无明确结论（网络/限流等），稍后再试', 'warn'],
+        unknown: ['无法探测：上游客户端未配置', 'err'],
+      };
+      const m = map[r.verdict] || [r.verdict + (r.detail ? '：' + r.detail : ''), 'warn'];
+      toast(m[0], m[1]);
+      return; // 探测不改变状态，跳过下面的 loadOverview
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');
@@ -1449,10 +1527,12 @@ document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
 function startAddLogin() {
-  const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
+  // 站点（官方域表 cn/intl/workbuddy）：面板只传 site，realm 由后端按站点表决定，
+  // 避免前端自己维护一份域表。
+  const site = (document.querySelector('input[name="addSite"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
-  api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
+  api('login/start', { method: 'POST', body: JSON.stringify({ site }) }).then(r => {
     loginState = r.state;
     $('addUrl').textContent = r.url;
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
@@ -1478,6 +1558,15 @@ async function pollLogin() {
   try {
     const r = await api('login/poll?state=' + encodeURIComponent(loginState));
     pollFails = 0;
+    if (r.fatal) {
+      // 上游许可类终态（席位满 / 许可证过期 / 试用到期）：重试无意义，直接把上游
+      // 原话给用户（官方 SignLicenseError 行为）。
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      $('addErr').textContent = r.message || '登录被上游拒绝';
+      return;
+    }
     if (r.done) {
       stopPoll();
       $('addReady').hidden = true;
@@ -2009,12 +2098,35 @@ function qrowHTML(it) {
     '<span class="msg">' + esc(it.message || '') + '</span>' +
     '</div>';
 }
+/* 任务中心筛选：默认收起「已完成」与「该账号没有此任务」两类噪音行。
+   开关只影响渲染，不重新打上游；状态存本机，下次打开沿用。 */
+const LS_TC_HIDE_DONE = 'wb2api.tc.hideDone', LS_TC_HIDE_NA = 'wb2api.tc.hideNa';
+let tcHideDone = localStorage.getItem(LS_TC_HIDE_DONE) !== '0';
+let tcHideNa = localStorage.getItem(LS_TC_HIDE_NA) !== '0';
+let tcLastRender = null; // 最近一次 renderQueue 的原始入参，供切换开关时原地重绘
+const TC_NA_MESSAGE = '该账号没有此任务';
+function tcRowHidden(row) {
+  if (tcHideDone && row.status === 'done') return true;
+  if (tcHideNa && String(row.message || '').trim() === TC_NA_MESSAGE) return true;
+  return false;
+}
 function renderQueue(groups, progress, emptyTitle, emptyDesc) {
+  tcLastRender = { groups, progress, emptyTitle, emptyDesc };
+  const rawRows = groups.reduce((n, g) => n + g.rows.length, 0);
+  groups = groups
+    .map(g => Object.assign({}, g, { rows: g.rows.filter(row => !tcRowHidden(row)) }))
+    .filter(g => g.rows.length);
+  const hiddenRows = rawRows - groups.reduce((n, g) => n + g.rows.length, 0);
   const empty = $('tcEmpty'), list = $('qcList');
   if (!groups.length) {
     empty.style.display = '';
-    if (emptyTitle) empty.querySelector('.t').textContent = emptyTitle;
-    if (emptyDesc) empty.querySelector('.d').textContent = emptyDesc;
+    if (rawRows) {
+      empty.querySelector('.t').textContent = '当前筛选下没有任务';
+      empty.querySelector('.d').textContent = '已隐藏 ' + rawRows + ' 行（已完成 / 该账号没有此任务），取消上方勾选即可查看。';
+    } else {
+      if (emptyTitle) empty.querySelector('.t').textContent = emptyTitle;
+      if (emptyDesc) empty.querySelector('.d').textContent = emptyDesc;
+    }
     list.innerHTML = '';
     $('qProg').hidden = true; $('tcSummary').textContent = '';
     return;
@@ -2031,9 +2143,19 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');
   const taskCount = groups.reduce((sum, group) => sum + group.rows.filter(row => row.kind !== 'account').length, 0);
-  $('tcSummary').textContent = taskCount + ' 项任务' + (total > taskCount ? ' · ' + (total - taskCount) + ' 条账号状态' : '');
+  $('tcSummary').textContent = taskCount + ' 项任务' + (total > taskCount ? ' · ' + (total - taskCount) + ' 条账号状态' : '') +
+    (hiddenRows ? ' · 已隐藏 ' + hiddenRows : '');
   updateProgress(progress);
 }
+function syncTcFilter(kind) {
+  if (kind === 'done') localStorage.setItem(LS_TC_HIDE_DONE, tcHideDone ? '1' : '0');
+  if (kind === 'na') localStorage.setItem(LS_TC_HIDE_NA, tcHideNa ? '1' : '0');
+  if (tcLastRender) renderQueue(tcLastRender.groups, tcLastRender.progress, tcLastRender.emptyTitle, tcLastRender.emptyDesc);
+}
+$('tcHideDone').checked = tcHideDone;
+$('tcHideNa').checked = tcHideNa;
+$('tcHideDone').onchange = ev => { tcHideDone = ev.target.checked; syncTcFilter('done'); };
+$('tcHideNa').onchange = ev => { tcHideNa = ev.target.checked; syncTcFilter('na'); };
 $('qcList').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-task-uid]');
   if (b) openTasks(b.dataset.taskUid);
@@ -4168,9 +4290,20 @@ function renderBalanceFoot(rows, now, winDays) {
     ? '<td class="num" style="color:' + (v > 0 ? 'var(--ok)' : v < 0 ? 'var(--bad)' : 'inherit') + '">' +
       (v > 0 ? '+' : '') + fmtNum(v) + '</td>'
     : '<td class="num na">—</td>';
+  // 可用账号数：该域内**当前真正能干活**的账号（未禁用且未暂停）。
+  // 为什么放在合计行：「合计余额」是历史水位之和，可能包含已死号的残留 ——
+  // 只看余额会高估可用资源，必须并排给出「这些钱有几个号在扛」。
+  let usable = 0;
+  rows.forEach(s => {
+    const a = acctStateOf(s.uid);
+    if (!a) { usable += 1; return; } // 无状态记录：按可用计（不无端扣减）
+    if (!a.disabled && !a.paused) usable += 1;
+  });
   host.innerHTML = '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
-    '<td>合计（' + esc(realmLabel(bhRealm)) + '）</td>' +
+    '<td>合计（' + esc(realmLabel(bhRealm)) + '）' +
+      '<span class="hint" style="margin-left:8px;color:var(--ink-3)">可用 ' + usable + '/' + rows.length + '</span>' +
+    '</td>' +
     '<td class="num">' + fmtNum(cur) + '</td>' +
     // 最低/最高不求和——见函数头注释
     '<td class="num na" title="各账号低谷不在同一时刻，不可相加">—</td>' +
@@ -4201,16 +4334,35 @@ async function loadBalance() {
     // 积分不同源、不可互换，相加得出的数没有意义（见 BH_REALMS 注释）。
     let total = 0, delta = 0;
     rows.forEach(s => { total += Number(s.current || 0); delta += Number(s.change || 0); });
+    // 可用账号数：未禁用且未暂停（口径与合计行一致，两处必须同源）。
+    let usableCount = 0;
+    rows.forEach(s => {
+      const a = acctStateOf(s.uid);
+      if (!a || (!a.disabled && !a.paused)) usableCount += 1;
+    });
     const st = $('bhStats');
     if (st) st.innerHTML =
       bhCard('账号', String(rows.length)) +
+      // 可用数单列：合计余额可能包含已死号的残留，必须并排看「几个号在扛这些分」。
+      bhCard('可用', String(usableCount) + '/' + String(rows.length), usableCount < rows.length ? 'bad' : '') +
       bhCard('当前合计', fmtNum(total)) +
       bhCard('窗口净变化', (delta > 0 ? '+' : '') + fmtNum(delta), delta > 0 ? 'ok' : delta < 0 ? 'bad' : '') +
       bhCard('采样点数', fmtNum(rows.reduce((a, s) => a + (s.points || []).length, 0)));
     const tb = $('bhAccBody');
     if (tb) tb.innerHTML = rows.length ? rows.map((s, i) =>
       '<tr><td class="mark"><i class="dot" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i></td>' +
-      '<td>' + esc(s.name || s.uid.slice(0, 8)) + '</td>' +
+      (() => {
+        const a = acctStateOf(s.uid);
+        // 账号已禁用/暂停：名字后加小标签。曲线仍展示（历史数据有意义），
+        // 但要让读者知道「之后不再更新」的原因，否则会把断更误读成没在用。
+        const mark = !a ? ''
+          : a.disabled ? '<span class="tag bad" style="margin-left:6px">' + esc(disabledKind(a.reason).label) + '</span>'
+          : a.paused ? '<span class="tag warn" style="margin-left:6px">暂停选号</span>'
+          : '';
+        const nm = s.name || s.uid.slice(0, 8);
+        const tip = a && a.reason ? nm + ' · ' + a.reason : nm;
+        return '<td title="' + esc(tip) + '">' + esc(nm) + mark + '</td>';
+      })() +
       '<td class="num">' + fmtNum(s.current) + '</td>' +
       '<td class="num">' + fmtNum(s.min) + '</td>' +
       '<td class="num">' + fmtNum(s.max) + '</td>' +

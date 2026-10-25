@@ -140,13 +140,16 @@ func TestClassify(t *testing.T) {
 		// 其他业务码不劫持（不许把网关 401 的判定扩张到带信封的响应）。
 		{401, `{"code":12153,"msg":"12153:refresh token is invalid"}`, ErrSessionDead},
 		{401, `{"code":1,"msg":"unknown business error"}`, ErrClient},
-		// 6021「queue.full.title」渠道级准入队列满：任意状态码都判 upstream_busy
-		//（防上游换状态码），结构化 code 主判、requestId 含 "6021" 不误伤。
+		// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：
+		// 任意状态码都判 upstream_busy（防上游换状态码），结构化 code 主判、
+		// requestId 含 "6020"/"6021" 不误伤。
+		{429, `{"code":6020,"msg":"queue.waiting.title","requestId":"01a16e3d95b4a000e3385c807c"}`, ErrUpstreamBusy},
 		{429, `{"code":6021,"msg":"queue.full.title","requestId":"341738971737c911985e5b9e67a4eceb"}`, ErrUpstreamBusy},
 		{500, `{"code":6021,"msg":"queue.full.title"}`, ErrUpstreamBusy},
 		// 防过宽：普通 429（无 queue 语义）仍是账号级软限流。
 		{429, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
 		{429, `{"requestId":"6021","msg":"rate limit"}`, ErrSoftRate},
+		{429, `{"requestId":"6020","msg":"rate limit"}`, ErrSoftRate},
 		// 11148 工具配对断裂：请求内容级（上游「直接重试无效，请新建任务」），
 		// 换号/重试必然同样失败——不得落 ErrClient 白轮转全池。
 		{400, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
@@ -172,6 +175,11 @@ func TestIsModelRateLimit(t *testing.T) {
 		// 6004：模型级限流（issue #31 的核心场景）。
 		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, true},
 		{`{"code": 6004,"msg":"x"}`, true},
+		// 6000：上游新码，文案带「切换其他模型」才按模型级（2026-10-24 kimi 实测）。
+		{`{"code":6000,"msg":"您的使用量已超出频率限制，将在 2026-10-24 19:25:18 UTC+8 重置，您也可以切换其他模型继续使用。"}`, true},
+		{`{"code": 6000, "msg":"您也可以切换其他模型继续使用"}`, true},
+		// 6000 但无换模型提示：账号级，不能放宽成模型级。
+		{`{"code":6000,"msg":"账号并发超限"}`, false},
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
@@ -513,6 +521,77 @@ func TestBasesAlwaysCN(t *testing.T) {
 	// 恒 CN：domain 不同不改变上游 host。
 	if c.chatBase(other) != c.chatBase(cn) || c.billingBase(other) != c.billingBase(cn) {
 		t.Error("bases must be CN regardless of domain")
+	}
+}
+
+// TestGlobalBaseByDomain 覆盖 global 域按 auth 文件 domain 选上游主机：
+// codebuddy.ai → 官方国际站，workbuddy.ai → 旧桌面端，其它/空 → 默认（官方国际站）。
+//
+// 为什么必须按 domain：国际域两套主机名并存（老账号 workbuddy.ai、官方 CLI 新登录
+// codebuddy.ai），只按 realm 选主机必然把一半账号打到非其签发域。
+func TestGlobalBaseByDomain(t *testing.T) {
+	c := New()
+	c.ChatBaseGlobal = ""
+	c.BillingBaseGlobal = ""
+
+	cases := []struct {
+		name        string
+		domain      string
+		realm       string
+		wantChat    string
+		wantBilling string
+		wantWeb     string
+	}{
+		{name: "官方国际站", domain: "www.codebuddy.ai",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		{name: "官方国际站裸域", domain: "codebuddy.ai",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		{name: "旧桌面端", domain: "www.workbuddy.ai",
+			wantChat: "https://www.workbuddy.ai", wantBilling: "https://www.workbuddy.ai", wantWeb: "https://www.workbuddy.ai"},
+		{name: "旧桌面端裸域", domain: "workbuddy.ai",
+			wantChat: "https://www.workbuddy.ai", wantBilling: "https://www.workbuddy.ai", wantWeb: "https://www.workbuddy.ai"},
+		// 显式 realm=global 但 domain 缺失/非国际域（手写扁平 auth）→ 回落官方国际站默认，
+		// 不按 domain 猜。
+		{name: "global 无 domain 回落默认", realm: "global", domain: "",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		{name: "global 非国际域回落默认", realm: "global", domain: "example.com",
+			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
+		// 非 global 账号恒走 CN 三域（realm 决定域，domain 只在 global 内选主机）。
+		// CN 三个 base 本来就不同源：chat=copilot、billing=codebuddy.cn、web=workbuddy.cn。
+		{name: "空 domain 非 global 走 CN", domain: "",
+			wantChat: "https://copilot.tencent.com", wantBilling: "https://www.codebuddy.cn", wantWeb: "https://www.workbuddy.cn"},
+		{name: "非国际域非 global 走 CN", domain: "example.com",
+			wantChat: "https://copilot.tencent.com", wantBilling: "https://www.codebuddy.cn", wantWeb: "https://www.workbuddy.cn"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &auth.Auth{Domain: tc.domain, AccessToken: "at"}
+			if tc.realm != "" {
+				if _, err := auth.BackfillRealmFor(a, tc.realm); err != nil {
+					t.Fatalf("set realm: %v", err)
+				}
+			}
+			if got := c.chatBase(a); got != tc.wantChat {
+				t.Errorf("chatBase(realm=%q domain=%q)=%q want %q", a.Realm(), tc.domain, got, tc.wantChat)
+			}
+			if got := c.billingBase(a); got != tc.wantBilling {
+				t.Errorf("billingBase(realm=%q domain=%q)=%q want %q", a.Realm(), tc.domain, got, tc.wantBilling)
+			}
+			if got := c.webBase(a); got != tc.wantWeb {
+				t.Errorf("webBase(realm=%q domain=%q)=%q want %q", a.Realm(), tc.domain, got, tc.wantWeb)
+			}
+		})
+	}
+
+	// 显式配置优先于 domain 推断（部署侧要指到自建反代时不能被 domain 覆盖）。
+	c.ChatBaseGlobal = "https://chat.global.example"
+	c.BillingBaseGlobal = "https://billing.global.example"
+	a := &auth.Auth{Domain: "www.codebuddy.ai", AccessToken: "at"}
+	if got := c.chatBase(a); got != "https://chat.global.example" {
+		t.Errorf("显式 ChatBaseGlobal 被 domain 覆盖：%q", got)
+	}
+	if got := c.billingBase(a); got != "https://billing.global.example" {
+		t.Errorf("显式 BillingBaseGlobal 被 domain 覆盖：%q", got)
 	}
 }
 

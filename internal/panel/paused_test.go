@@ -119,6 +119,18 @@ const ctx = {
   esc: s => String(s == null ? '' : s), dur: () => '1m', ago: () => '刚刚',
   remarkName: (uid, html) => html, // 备注是展示层增强，本测试只关心 paused 徽标/按钮
   rateLimitRowsHtml: () => '', formatTokenCount: () => '0', formatLatency: () => '-', formatRate: () => '-',
+  // 禁用原因分类与时长：定义在 renderAccounts 之前（抽取范围外），此处按真实实现注入，
+  // 否则 renderAccounts 一进禁用分支就 ReferenceError。
+  disabledKind: reason => {
+    const r = String(reason || '').toLowerCase();
+    if (/11140|banned|restricted|request illegal/.test(r)) return { label: '上游封禁', tone: 'bad', action: '需在官方申诉，revive 无效' };
+    if (/refresh.*失败/.test(r)) return { label: '登录失效', tone: 'bad', action: '需重新登录' };
+    if (/12153/.test(r)) return { label: '登录失效', tone: 'bad', action: '需重新登录' };
+    if (/401/.test(r)) return { label: '鉴权失败', tone: 'warn', action: '确认后重登或恢复' };
+    if (/manual|手动/.test(r)) return { label: '手动禁用', tone: 'warn', action: '随时可恢复' };
+    return { label: '已禁用', tone: 'warn', action: '' };
+  },
+  disabledAge: () => '3 天前',
 };
 vm.createContext(ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.renderAccounts = renderAccounts;', ctx);
