@@ -4,6 +4,7 @@ package updater
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -55,4 +56,36 @@ func launchCleanup(executable, path string, pid int) {
 func processSupervised() bool {
 	managed, err := svc.IsWindowsService()
 	return err == nil && managed
+}
+
+// waitChildHealthy 等一个刚拉起的子进程活过观察窗口：窗口内退出返回错误（调用
+// 方据此回滚旧版本），活过窗口返回 nil。Windows 按 pid 打开 SYNCHRONIZE 句柄做
+// 0ms 探测轮询（WAIT_OBJECT_0 = 已退出，WAIT_TIMEOUT = 仍在运行），与
+// waitForProcessExit 同款手法（os.Process 的句柄字段未导出，拿不到现成的）。
+func waitChildHealthy(cmd *exec.Cmd, window time.Duration) error {
+	handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(cmd.Process.Pid))
+	if err != nil {
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			return errors.New("新版本进程在观察窗口内退出")
+		}
+		return fmt.Errorf("观察新版本进程: %w", err)
+	}
+	defer windows.CloseHandle(handle)
+	deadline := time.Now().Add(window)
+	for {
+		result, err := windows.WaitForSingleObject(handle, 0)
+		if err != nil {
+			return fmt.Errorf("观察新版本进程: %w", err)
+		}
+		if result == windows.WAIT_OBJECT_0 {
+			return errors.New("新版本进程在观察窗口内退出")
+		}
+		if result != uint32(windows.WAIT_TIMEOUT) {
+			return errors.New("观察新版本进程失败")
+		}
+		if !time.Now().Before(deadline) {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }

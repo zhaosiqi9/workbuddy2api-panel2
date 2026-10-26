@@ -6,6 +6,9 @@ version: 2
 upstream:
   # 逐个 clone 下来交给 agent 分析的对象。
   repos:
+    # 官方客户端行为的对照实现最全的一个：product.json 取值、每类请求的头/体形状、
+    # 备用入口与 HTTPDNS、业务码处置都有抓包依据，docs/official-client.md 是现成清单
+    - yreidev/workbuddy2api-panel
     # 上游停维护后最活跃的 fork：面板资源占用优化、.deb/systemd 打包、企业微信推送都出自这里
     - LeisureLinux/workbuddy2api-panel
     - ardeyouxipianyi/workbuddy2api-hub

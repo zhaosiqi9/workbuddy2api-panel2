@@ -72,6 +72,10 @@ type Config struct {
 	// 裸用/测试路径经 loadLive() 归一化后使用）。
 	ModelsHidden []string
 
+	// ModelsAllowed 模型白名单原始条目（config models.allowed，issue #68；
+	// Live 为 nil 的裸用/测试路径经 loadLive() 归一化后使用）。
+	ModelsAllowed []string
+
 	// ModelsAliases 模型映射原始条目（config models.aliases，"客户端名=真实名"；
 	// issue #30；Live 为 nil 的裸用/测试路径经 loadLive() 归一化后使用）。
 	ModelsAliases []string
@@ -107,11 +111,15 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	if h.cfg.Live != nil {
 		return h.cfg.Live.Load()
 	}
+	// 白名单静态回退（issue #68）：裸用/单测路径不依赖 Live，与 Hidden 对称。
+	allowed, enabled := livecfg.NormalizeAllowedModels(h.cfg.ModelsAllowed)
 	return livecfg.Snapshot{
 		APIKey:           h.cfg.APIKey,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		AllowedModels:    allowed,
+		AllowlistEnabled: enabled,
 		ModelAliases:     livecfg.NormalizeModelAliases(h.cfg.ModelsAliases),
 	}
 }
@@ -367,6 +375,12 @@ func (h *Handler) capacity(w http.ResponseWriter, r *http.Request) {
 	if h.hiddenModel(realm, bareModel) {
 		modelAvailable = 0
 	}
+	// models.allowed 白名单（issue #68）：与 hidden 的归零对称——白名单启用且模型
+	// 不在白名单，这里也必须报零容量。信息面不成为绕过口：客户端按 /v1/capacity
+	// 选模型时，调不通的模型不该显示「有号可用」。
+	if !h.allowedModel(realm, bareModel) {
+		modelAvailable = 0
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"model":                    model,
 		"model_available_accounts": modelAvailable,
@@ -499,12 +513,34 @@ func (h *Handler) hiddenModel(realm, bare string) bool {
 	return hide
 }
 
+// allowedModel 报告 (realm, 裸模型名) 是否被 config models.allowed 白名单放行（issue #68）。
+//
+// 白名单语义是「不在白名单 = 对本网关不存在」：未启用（空配置/全空条目）恒为
+// true（默认放行全部，向后兼容）；启用时非白名单条目一律 false。四个生效点
+// （cn 对话列表 / global 对话列表 / 出图单列 / chat 与出图入口点名）全部只经由
+// 本谓词——与 hiddenModel 同一单点收敛教训：漏一处判据就等于白名单可被绕过。
+func (h *Handler) allowedModel(realm, bare string) bool {
+	snap := h.loadLive()
+	if !snap.AllowlistEnabled {
+		return true
+	}
+	if bare == "" {
+		return false
+	}
+	_, ok := snap.AllowedModels[realm+":"+bare]
+	return ok
+}
+
 // modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
 // 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
+		// 白名单过滤（issue #68）：启用时不在白名单的模型不进 cn 对话列表。
+		if !h.allowedModel("cn", mi.ID) {
+			continue
+		}
 		if h.hiddenModel("cn", mi.ID) {
 			continue
 		}
@@ -551,6 +587,10 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
+			// 白名单过滤（issue #68）：global 列表与 cn 同判据。
+			if !h.allowedModel("global", id) {
+				continue
+			}
 			if h.hiddenModel("global", id) {
 				continue
 			}
@@ -605,6 +645,10 @@ func (h *Handler) generationModelEntries() []map[string]any {
 			}
 			// 黑名单同样管出图单列：列表里留着它等于告诉客户端「这个能用」。
 			if h.hiddenModel(realm, mi.ID) {
+				continue
+			}
+			// 白名单同样管出图单列（issue #68）：白名单外的出图模型不该被发现。
+			if !h.allowedModel(realm, mi.ID) {
 				continue
 			}
 			entry := map[string]any{
@@ -833,6 +877,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
+
+	// models.allowed 白名单（issue #68）：别名映射之后、黑名单检查之前——
+	// 别名解析出的真实目标同样受检，不能绕过白名单（与 hidden 同一条不变量）。
+	// 白名单外一律 400 拒绝，不打上游、不占选号；文案不区分「不存在」与
+	// 「未在白名单」，避免枚举探测。
+	if !h.allowedModel(realm, bareModel) {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
+			"model is not in the gateway allowlist, try another model", "")
+		st.status = http.StatusBadRequest
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
 
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
@@ -1483,6 +1539,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//
 			// 级别是 INFO 不是 WARN：这是合法收尾，不是故障。记 WARN 会进「错误汇总」
 			// 的兜底桶（其他（未归类）），把正常回合当成错误看待。
+			st.toolsDeclared = len(declaredTools)
+			if stats.SawToolCalls() {
+				st.toolCalls = 1
+			}
 			if len(declaredTools) > 0 && !stats.SawToolCalls() && stats.FinishReason() == "stop" {
 				log.Printf("INFO: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (本轮无工具调用，正常收尾)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools))
@@ -1557,6 +1617,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 				bareModel, m, len(declaredTools))
 		}
+		// issue #44 观测（非流式）：与流式同口径记下声明数与实际调用数。
+		st.toolsDeclared = len(declaredTools)
+		st.toolCalls = toolCallCount(resp)
 		ud := usageDeltaFromResponse(resp)
 		credit, total, hasCredit := usageCreditTotal(resp)
 		recordAttempt(acct.UID, ud, credit, hasCredit, attemptStarted, 0)
@@ -1898,6 +1961,14 @@ func validUsageCredit(credit float64, present bool) bool {
 // parseUsageTotalTokens 只接受落在 int 范围的有限正整数（小数/越界/NaN 一律拒绝）。
 func parseUsageTotalTokens(total float64) (int, bool) {
 	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
+		return 0, false
+	}
+	// 越界判定必须在 int 转换之前用 float 比较：arm64 的 float→int 越界转换饱和
+	// （2^63 变成 MaxInt64），下面 float64(parsed) 的反向校验会被舍入等价骗过，
+	// 越界入参被放行（x86 上绕回负数能被 parsed<=0 拦住，故 Linux CI 复现不了，
+	// out_of_range_total 用例在 Apple Silicon 上必红）。token 数永远不会逼近 2^63，
+	// 前置拒绝零误伤。
+	if total >= float64(math.MaxInt64) {
 		return 0, false
 	}
 	parsed := int(total)

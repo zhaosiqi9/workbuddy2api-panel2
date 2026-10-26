@@ -84,6 +84,16 @@ type Event struct {
 	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
 	ClientIP        string `json:"client_ip,omitempty"`
 	UserAgent       string `json:"user_agent,omitempty"`
+	Mode            string `json:"mode,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	ReasoningTokens int64  `json:"reasoning_tokens,omitempty"`
+	ExecutorType    string `json:"executor_type,omitempty"`
+	// ToolsDeclared / ToolCalls 本轮的「工具面」观测量（issue #44）：声明了几个工具、
+	// 实际拿到几个工具调用。ToolsDeclared>0 且 ToolCalls==0 就是一次「零工具调用
+	// 收尾」——上游把本该调工具的回合当成正常完成，客户端据此认为任务做完、工具一次
+	// 没跑。只记数量，不记工具名与参数。
+	ToolsDeclared int `json:"tools_declared,omitempty"`
+	ToolCalls     int `json:"tool_calls,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

@@ -347,13 +347,18 @@ func main() {
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	// 模型白名单（issue #68）：启动时归一化一次，快照只读持有。
+	allowedModels, allowlistEnabled := livecfg.NormalizeAllowedModels(cfg.Models.Allowed)
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
-		ModelAliases:         livecfg.NormalizeModelAliases(cfg.Models.Aliases),
+		// 模型白名单（issue #68）：归一化集合 + 启用标志；空配置 = 不启用。
+		AllowedModels:    allowedModels,
+		AllowlistEnabled: allowlistEnabled,
+		ModelAliases:     livecfg.NormalizeModelAliases(cfg.Models.Aliases),
 		// 模型降级路由表（pool.model_fallback）：6004 限流时同账号改用等价模型。
 		ModelFallback: cfg.Pool.ModelFallback,
 	})
@@ -490,6 +495,8 @@ func main() {
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
+		// 模型白名单原始条目（issue #68）；同上，运行期以 livecfg 快照为准。
+		ModelsAllowed: cfg.Models.Allowed,
 		// 模型映射原始条目（issue #30）；同上，运行期以 livecfg 快照为准。
 		ModelsAliases:    cfg.Models.Aliases,
 		AdminEnabled:     cfg.Admin.Enabled,
@@ -776,13 +783,18 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	// 白名单同步重建（issue #68）：面板保存 models.allowed 后即时生效。
+	newAllowedModels, newAllowlistEnabled := livecfg.NormalizeAllowedModels(newCfg.Models.Allowed)
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
-		ModelAliases:         livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
+		// 白名单热生效：与 HiddenModels 同一条快照重建通路（issue #68）。
+		AllowedModels:    newAllowedModels,
+		AllowlistEnabled: newAllowlistEnabled,
+		ModelAliases:     livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)

@@ -30,6 +30,19 @@ const (
 	cleanupArg     = "--wb2api-cleanup"
 )
 
+// 更新流程的时间参数集中在这里，测试可注入短值。
+var (
+	// downloadStallWindow 下载「N 秒无新字节」卡死守卫窗口。
+	downloadStallWindow = 30 * time.Second
+	// installWatchdog Install「成功」后，等 helper 完成替换的看门狗期限。
+	installWatchdog = 90 * time.Second
+	// childGraceWindow 新版本进程拉起后的健康观察窗口，活过才删回滚备份。
+	childGraceWindow = 8 * time.Second
+	// staleTempAge 启动时清扫更新残留临时文件的修改时间阈值；helper 的整个
+	// 生命周期（下载+替换+观察窗口）远短于该值，不会误删在途更新。
+	staleTempAge = 6 * time.Hour
+)
+
 // Settings controls the optional daily automatic install.
 type Settings struct {
 	AutoEnabled bool
@@ -122,7 +135,41 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		},
 	}
 	m.status.CanInstall = m.canInstallLocked()
+	if executable != "" {
+		CleanupStaleTempFiles(filepath.Dir(executable), staleTempAge)
+	}
 	return m
+}
+
+// CleanupStaleTempFiles 清扫程序目录里上一次更新失败残留的临时文件
+// （.wb2api-stage-* / .wb2api-updater-* / .wb2api-release-*.zip），只清修改时间
+// 超过阈值的（在途更新的整个生命周期远短于阈值）；回滚备份 *.old 一律不动——
+// 那是失败现场。helper 侧多个失败分支（pid 无效、参数损坏、旧进程迟迟不退）此前
+// 会把 stage/helper 永久留在磁盘上，这里在下次启动时兜底回收。
+func CleanupStaleTempFiles(dir string, olderThan time.Duration) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-olderThan)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, ".wb2api-stage-") &&
+			!strings.HasPrefix(name, ".wb2api-updater-") &&
+			!strings.HasPrefix(name, ".wb2api-release-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err == nil {
+			log.Printf("[updater] 已清扫更新残留文件 %s（修改于 %s）", name, info.ModTime().Format(time.RFC3339))
+		}
+	}
 }
 
 // SetRestart installs the callback used after an update helper is ready.
@@ -390,7 +437,25 @@ func (m *Manager) Install(ctx context.Context) (err error) {
 		return fmt.Errorf("启动更新进程: %w", err)
 	}
 	log.Printf("[updater] 已准备 v%s，服务即将重启", version.text)
+	m.armInstallWatchdog()
 	return nil
+}
+
+// armInstallWatchdog Install「成功」只代表 helper 进程被拉起来了，真正的换二进制
+// 发生在 helper 子进程里。若 helper 中途失败（Windows 下目标文件被占用、磁盘满、
+// 新版本起不来），父进程继续活着且 Installing 永久为 true，之后每次安装都被
+// 「更新已在进行中」挡住，只能手动重启进程恢复。看门狗在期限内发现进程没有重启
+// 就复位状态并留下原因，面板可重试而不是永久卡死。
+func (m *Manager) armInstallWatchdog() {
+	time.AfterFunc(installWatchdog, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.status.Installing {
+			return
+		}
+		m.status.Installing = false
+		m.status.LastError = fmt.Sprintf("更新进程在 %s 内未完成替换，若服务仍在运行请检查日志后重试", installWatchdog)
+	})
 }
 
 func (m *Manager) downloadAsset(ctx context.Context, asset *releaseAsset, dst io.Writer) error {
@@ -404,6 +469,11 @@ func (m *Manager) downloadAsset(ctx context.Context, asset *releaseAsset, dst io
 		baseClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	client := *baseClient
+	// 整体 Client.Timeout 覆盖「连接到读完响应体」全程：更新包上限 300MB，慢网下
+	// 30s 必超时。下载改为无整体超时 + 两级守卫：响应头限时（Transport）与「N 秒
+	// 无新字节」卡死守卫（stallGuard）——只要数据在推进就允许慢慢下。
+	client.Timeout = 0
+	client.Transport = withHeaderTimeout(client.Transport)
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return errors.New("下载更新文件重定向次数过多")
@@ -424,9 +494,12 @@ func (m *Manager) downloadAsset(ctx context.Context, asset *releaseAsset, dst io
 	if resp.ContentLength > maxArchiveSize {
 		return errors.New("下载文件超过大小限制")
 	}
-	n, err := io.Copy(dst, io.LimitReader(resp.Body, maxArchiveSize+1))
+	guard := &stallGuard{r: resp.Body, closeFn: resp.Body.Close, window: downloadStallWindow}
+	guard.timer = time.AfterFunc(downloadStallWindow, func() { _ = guard.closeFn() })
+	defer guard.timer.Stop()
+	n, err := io.Copy(dst, io.LimitReader(guard, maxArchiveSize+1))
 	if err != nil {
-		return fmt.Errorf("写入更新文件失败: %w", err)
+		return fmt.Errorf("下载更新文件失败（中断或 %.0fs 无进展）: %w", downloadStallWindow.Seconds(), err)
 	}
 	if n > maxArchiveSize {
 		return errors.New("下载文件超过大小限制")
@@ -437,6 +510,41 @@ func (m *Manager) downloadAsset(ctx context.Context, asset *releaseAsset, dst io
 	return nil
 }
 
+// withHeaderTimeout 给下载 transport 补一个响应头限时（无则克隆默认 transport）。
+// m.client 的 Transport 可能是测试注入的 roundTripper，保持原样不叠加。
+func withHeaderTimeout(rt http.RoundTripper) http.RoundTripper {
+	var tr *http.Transport
+	if t, ok := rt.(*http.Transport); ok {
+		tr = t.Clone()
+	} else if rt == nil {
+		tr = http.DefaultTransport.(*http.Transport).Clone()
+	} else {
+		return rt
+	}
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	return tr
+}
+
+// stallGuard 下载卡死守卫：N 秒无新字节就关闭响应体。客户端的 Response.Body
+// 没有 SetReadDeadline（那是服务端 ResponseController 的能力，HTTP/1.1 的阻塞
+// Read 等在 transport 读循环的 channel 上，连接级 deadline 也打断不了它），
+// 只能靠 Close 掐断——Close 会让阻塞中的 Read 立刻返回错误。每读到新字节重置
+// 定时器，「慢但在动」不受影响，「彻底不动」在窗口内快速失败。
+type stallGuard struct {
+	r       io.Reader
+	closeFn func() error
+	window  time.Duration
+	timer   *time.Timer
+}
+
+func (s *stallGuard) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 && s.timer != nil {
+		s.timer.Reset(s.window)
+	}
+	return n, err
+}
+
 // HandleSelfUpdate handles the private helper invocation used by Install.
 // It returns handled=false for normal server startup.
 func HandleSelfUpdate(args []string) (handled bool, err error) {
@@ -444,6 +552,9 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 		pid, parseErr := strconv.Atoi(args[2])
 		if parseErr != nil || pid <= 0 {
 			return true, errors.New("清理进程参数中的 pid 无效")
+		}
+		if err := validateHelperPath(args[3], ".wb2api-"); err != nil {
+			return true, err
 		}
 		if err := waitForProcessExit(pid, 60*time.Second); err != nil {
 			return true, err
@@ -458,6 +569,19 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 		return true, errors.New("更新进程参数中的 pid 无效")
 	}
 	stagePath, targetPath, cwd, originalArgsJSON := args[3], args[4], args[5], args[6]
+	if err := validateHelperPath(stagePath, ".wb2api-"); err != nil {
+		return true, err
+	}
+	if err := validateHelperPath(targetPath, ""); err != nil {
+		return true, err
+	}
+	// 失败路径不再残留 stage：成功替换后显式移除，其余任何退出路径由 defer 兜底。
+	replaced := false
+	defer func() {
+		if !replaced {
+			os.Remove(stagePath)
+		}
+	}()
 	var originalArgs []string
 	if err := json.Unmarshal([]byte(originalArgsJSON), &originalArgs); err != nil {
 		return true, fmt.Errorf("解析原始启动参数: %w", err)
@@ -476,30 +600,75 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 			_ = os.Remove(helperPath)
 		}
 	}
-	startTarget := func() error {
+	startTarget := func() (*exec.Cmd, error) {
 		cmd := exec.Command(targetPath, originalArgs...)
 		cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-		return startChild(cmd)
+		return cmd, cmd.Start()
+	}
+	replaceFailed := func(reason error) error {
+		cmd, restartErr := startTarget() // 替换失败时 target 仍是旧二进制，把服务拉回来
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Release()
+		}
+		_ = os.Remove(stagePath)
+		replaced = true
+		cleanupHelper()
+		return errors.Join(reason, restartErr)
 	}
 	restore, cleanup, err := replaceBinaryWithRollback(stagePath, targetPath)
 	if err != nil {
-		restartErr := startTarget()
-		_ = os.Remove(stagePath)
-		cleanupHelper()
-		return true, errors.Join(fmt.Errorf("替换程序文件: %w", err), restartErr)
+		return true, replaceFailed(fmt.Errorf("替换程序文件: %w", err))
 	}
 	_ = os.Remove(stagePath)
-	if err := startTarget(); err != nil {
-		restoreErr := restore()
-		if restoreErr == nil {
-			restoreErr = startTarget()
+	replaced = true
+	cmd, err := startTarget()
+	if err != nil {
+		restartErr := restore()
+		if restartErr == nil {
+			if old, serr := startTarget(); serr == nil {
+				_ = old.Process.Release()
+			} else {
+				restartErr = serr
+			}
 		}
 		cleanupHelper()
-		return true, errors.Join(fmt.Errorf("启动新版本: %w", err), restoreErr)
+		return true, errors.Join(fmt.Errorf("启动新版本: %w", err), restartErr)
 	}
+	// 拉起 ≠ 能跑：配置不兼容、端口被占、依赖缺失都会让新版本启动即退。给它一个
+	// 短的观察窗口，窗口内退出就回滚旧版本（备份还在）；活过窗口才删备份与 helper。
+	if werr := waitChildHealthy(cmd, childGraceWindow); werr != nil {
+		if rerr := restore(); rerr != nil {
+			log.Printf("WARN: [updater] 新版本健康检查未通过且回滚失败: %v", rerr)
+		} else if old, serr := startTarget(); serr == nil {
+			_ = old.Process.Release()
+		} else {
+			log.Printf("WARN: [updater] 回滚后重启旧版本失败: %v", serr)
+		}
+		cleanupHelper()
+		return true, fmt.Errorf("新版本健康检查未通过: %w", werr)
+	}
+	_ = cmd.Process.Release()
 	cleanup()
 	cleanupHelper()
 	return true, nil
+}
+
+// validateHelperPath 把私有子命令的文件参数收敛到「自己程序目录里的更新文件」：
+// helper 与目标二进制同目录、临时文件必须是 .wb2api- 前缀。入口本身没有来源校验
+// （能本机执行通常已等同失陷），但其余环节（域名白名单、SHA-256、zip 路径穿越）
+// 都设了防，这里补上最后一块：把任意路径的删除/替换收敛为只能动自己的更新文件。
+func validateHelperPath(path, namePrefix string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("定位更新进程自身: %w", err)
+	}
+	if filepath.Dir(path) != filepath.Dir(self) {
+		return fmt.Errorf("更新文件参数不在程序目录内: %s", path)
+	}
+	if namePrefix != "" && !strings.HasPrefix(filepath.Base(path), namePrefix) {
+		return fmt.Errorf("更新文件名需以 %s 开头: %s", namePrefix, filepath.Base(path))
+	}
+	return nil
 }
 
 func launchUpdateHelper(helperPath string, args ...string) error {
@@ -697,7 +866,11 @@ func (m *Manager) Run(ctx context.Context) {
 		if autoDue || regularDue {
 			if err := m.Check(ctx); err != nil {
 				if ctx.Err() == nil {
-					log.Printf("WARN: [updater] release check: %v", err)
+					if autoDue {
+						log.Printf("WARN: [updater] 自动更新检查失败，今日自动更新未执行（明日自动时间再试）: %v", err)
+					} else {
+						log.Printf("WARN: [updater] release check: %v", err)
+					}
 				}
 			} else if autoDue && m.Status().UpdateAvailable && m.Status().CanInstall {
 				if err := m.Install(ctx); err != nil {
@@ -721,7 +894,12 @@ func (m *Manager) scheduleDue(now time.Time) (auto, regular bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	day := now.Format("2006-01-02")
-	auto = m.settings.AutoEnabled && now.Format("15:04") == m.settings.AutoTime && m.lastAutoDay != day
+	// 窗口式而非分钟精确相等：分钟 ticker 的相位漂移、上一轮 Check 占住循环跨过
+	// 目标分钟、进程在目标分钟之后才启动，精确相等都会让当天自动更新静默落空。
+	// 改为「今天还没跑过 且 已到/过目标时刻」——错过起点也能补跑当天的一次。
+	target, terr := time.Parse("15:04", m.settings.AutoTime)
+	auto = m.settings.AutoEnabled && terr == nil && m.lastAutoDay != day &&
+		now.Hour()*60+now.Minute() >= target.Hour()*60+target.Minute()
 	if auto {
 		m.lastAutoDay = day
 	}

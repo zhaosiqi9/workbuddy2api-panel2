@@ -361,7 +361,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 | 站点 | 上游 API | Origin | 说明 |
 |---|---|---|---|
-| `cn` | `copilot.tencent.com` | `www.codebuddy.cn` | 国内站（缺省） |
+| `cn` | `copilot.tencent.com` | `www.codebuddy.cn` | 国内站（缺省）；登录走 CLI 口径，与对话的主域不同源，见下 |
 | `intl` | `www.codebuddy.ai` | `www.codebuddy.ai` | 官方国际站（CLI `product.json` 的 externalDomain），新账号选这个 |
 | `workbuddy` | `www.workbuddy.ai` | `www.workbuddy.ai` | 旧桌面端国际版，仅已注册在该域的老账号 |
 
@@ -469,6 +469,7 @@ curl -s http://localhost:7863/v1/messages \
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `features.sanitize_brand_scope` | `all` | 品牌词（`DeepSeekRuntime`）规则作用域：`all` = 所有消息角色（与既有行为一致）；`identity` = 只改 `system` / `developer`，user / assistant / tool 历史与 `tool_calls` 参数按用户数据原样透传（实测这些位置不触发 `11-128`）。面板「品牌词作用域」保存后**热生效**，环境变量 `WB2A_SANITIZE_BRAND_SCOPE` |
 | `models.hidden` | `[]` | 模型黑名单：`["deepseek-pro"]` 裸名隐藏两域，`["cn:legacy-model"]` / `["global:x"]` 只隐藏该域。**列表不列 + 点名调用直接拒绝**（`/v1/models` 过滤、`/v1/chat/completions` 与 `/v1/images/*` 拒绝）——只藏列表不够，知道名字仍可硬调。面板「模型黑名单」（逗号分隔）保存后**热生效** |
+| `models.allowed` | `[]` | 模型白名单（issue #68）：条目语法同 `models.hidden`（`["glm-5.2"]` 裸名放行两域，`["cn:x"]` / `["global:x"]` 只放行该域）。**空数组/未配置 = 不启用（默认放行全部，向后兼容）**；非空时**仅白名单内模型可列出与被点名调用**（`/v1/models` 过滤、`/v1/chat/completions` 与 `/v1/images/*` 白名单外直接 400 拒绝，不打上游）。检查在别名映射之后、黑名单之前（别名不能绕过白名单；与 `models.hidden` 共存取交集：白名单圈定可见集合，黑名单仍可从中再剔除）。面板「模型白名单」（逗号/空白分隔，清空 = 关闭白名单）保存后**热生效** |
 | `models.aliases` | `[]` | 模型映射（issue #30）：`["claude-opus-4=glm-5.2"]`，客户端只能填固定模型名的 agent 靠它落到真实模型。键大小写不敏感；裸名键两域生效，`cn:`/`global:` 前缀键只在该域生效；值可带前缀跨域指向（`"my-gpt=global:gpt-5.4"`）。映射在**黑名单检查之前**完成（别名不能绕过 `models.hidden`），出站 body / 选号 / 粘性 / 账本全用真实名，响应 `model` 回显客户端原发名（严格校验模型名的客户端不会报错）。面板「模型映射」（逗号分隔）保存后**热生效** |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
@@ -810,12 +811,12 @@ http://127.0.0.1:7863/panel/
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。列表支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率、上下文、最大输出、ID 排序。**出图模型的倍率另有口径**：真实单价在每次出图回执 `usage.credit` 里，上游目录对出图模型**已基本不再报牌价**——CN `hunyuan-image-alpha` 实扣固定 **5.71/张**（与尺寸、画质、`n` 无关，回执带 `output_image_coefficient:1`），global `hy-image-3.5` 实扣固定 **0.27/张**（low/medium/high × 512/1024/1536 六档同价；回执恒 `output_image_tokens:15000` 但不带 coefficient——**token 数不代表单价**，按 token 反推价格会算错）。旧的 global `gpt-image-2.5-sunburst` 已下架（`400 code=14401 route config not found`），不再列出。面板因此把「牌价」与「实扣」分列，并按尺寸×画质分档显示（`charge_variants`），不用均值互相覆盖 |
-| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败 / 平均延迟）+ Token 时序图（渐变柱、均值线、峰值标注）+ 用量明细（按账号 / 模型 / 域切换）+ 积分扣除历史。**时间范围**支持 今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / **自定义区间**（精确到分钟），卡片、表格与图表全部按同一窗口统计 |
+| **用量** | 指标卡（请求数 / 总 token / 平均缓存命中率 / prompt / completion / 失败 / 平均延迟）+ Token 时序图（渐变柱、均值线、峰值标注）+ 用量明细（按账号 / 模型 / 域切换）+ 积分扣除历史。**时间范围**支持 今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / **自定义区间**（精确到分钟），卡片、表格与图表全部按同一窗口统计 |
 | **配置** | 在线编辑 config.json：API 密钥、版本更新（自动更新开关与上海时间）、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关、日志来源记录开关 |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持关键词与结果筛选、读取条数，以及 今天 / 近 24 小时 / 近 7 天 / **自定义区间**等**时间范围**查询（由归档侧按时间取，不是筛已拉取的条目）+ 最近 500 行服务日志（按任务 / 对话 / 系统分频道，可开关自动滚动），并新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`models.hidden`、`models.aliases`、`logging.request_client_info`、`pool.*`（熔断/在途/权重/保底倍率上限）、`schedule.*`（时点/开关/余额刷新间隔）、`update.*`（自动更新时间）**立即生效，无需重启**；
+`models.hidden`、`models.allowed`、`models.aliases`、`logging.request_client_info`、`pool.*`（熔断/在途/权重/保底倍率上限）、`schedule.*`（时点/开关/余额刷新间隔）、`update.*`（自动更新时间）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`、`admin`、`metrics`、`alerting`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
@@ -871,8 +872,9 @@ http://127.0.0.1:7863/panel/
 
 上游接口均为 CodeBuddy 官方 CLI / 插件使用的**非公开 / 逆向接口**，未见公开 API 文档；路径及 Host 以代码内常量为准（见文末出处表）。两类 base：
 
-- **`copilot.tencent.com`**：聊天补全（SSE）、token 刷新、OAuth、模型列表、growth 域（旅行 / streak）
-- **`www.codebuddy.cn`**：每日签到、余额查询、活跃上报
+- **`www.workbuddy.cn`**：聊天补全（SSE）、模型目录、growth 域（旅行 / streak）——官方桌面端 `product.json` 的 endpoint；`copilot.tencent.com` 是它 `NetworkFailover` 里的备选入口，可用 `cn.chat_base` 回填
+- **`www.codebuddy.cn`**：每日签到、余额查询、活跃上报、小程序上报（CLI 指纹域，任务计分依赖）
+- **`copilot.tencent.com`**：OAuth 与 token 刷新（官方 CLI 口径，`internal/loginsite` 单独维护）
 
 | 相对路径（绝对路径见出处表） | 方法 | 用途 |
 |---|---|---|

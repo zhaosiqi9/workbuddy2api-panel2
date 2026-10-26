@@ -449,7 +449,7 @@ $('btnLogout').onclick = () => {
 };
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -461,6 +461,7 @@ function go(v) {
   // 切到日志视图：本地窗口为空（首次）时全量拉一次；已有窗口则继续增量。
   // 注意**不要**在每次切视图时 resetLogWindow()——那会把增量游标清掉，下一轮
   // 又变成全量拉，白白丢掉增量带来的收益。
+  if (v === 'events') loadEvents();
   if (v === 'logs') { if (!logRows.length) resetLogWindow(); loadLogs(); }
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
@@ -1525,6 +1526,8 @@ const CFG_MAP = {
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   account_spread_minutes: ['schedule', 'account_spread_minutes'], account_spread_min_gap_seconds: ['schedule', 'account_spread_min_gap_seconds'],
+  balance_refresh_jitter_permill: ['schedule', 'balance_refresh_jitter_permill'], task_sweep_jitter_permill: ['schedule', 'task_sweep_jitter_permill'],
+  night_account_cap: ['schedule', 'night_account_cap'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -1545,6 +1548,7 @@ const CFG_MAP = {
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
   models_hidden: ['models', 'hidden'],
+  models_allowed: ['models', 'allowed'],
   models_aliases: ['models', 'aliases'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
@@ -1601,7 +1605,8 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       // 逗号/空白分隔的列表字段：空 = 显式清空黑名单（空数组照发，否则删不掉条目）。
-      if (name === 'models_hidden') v = raw.split(/[,，\s]+/).filter(Boolean);
+      // 白名单同款语义（issue #68）：空串显式发空数组 = 关闭白名单。
+      if (name === 'models_hidden' || name === 'models_allowed') v = raw.split(/[,，\s]+/).filter(Boolean);
       // 模型映射（issue #30）："客户端名=真实名" 条目数组，同列表语义；空数组照发 = 清空。
       else if (name === 'models_aliases') v = raw.split(/[,，]+/).map(s => s.trim()).filter(Boolean);
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
@@ -2681,8 +2686,10 @@ function renderUsage(d) {
   const okRate = reqs ? (reqs - errs) / reqs * 100 : null;
   // 构成条要的是合法 CSS 宽度，usPct 在无样本时返回 "—"，不能直接拼进 style。
   const pctW = (part) => total ? Math.max(0, Math.min(100, Number(part || 0) / total * 100)).toFixed(2) + '%' : '0%';
-  // 六张卡：主指标用强调色，completion 用成功色（与图表里的绿柱呼应），
+  // 七张卡：请求数 / 总 token / 平均缓存命中率是三张主指标（同一行，均用强调色），
+  // completion 用成功色（与图表里的绿柱呼应），
   // 失败/延迟只在有值时上语义色——全绿全黄的仪表盘等于没有重点。
+  const chTok = Number(t.cache_hit_tokens || 0), cmTok = Number(t.cache_miss_tokens || 0);
   $('usStats').innerHTML =
     usKpi(fmtTok(reqs), '请求数', 'c-accent',
       errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
@@ -2690,6 +2697,8 @@ function renderUsage(d) {
       'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
       '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
       '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
+    usKpi(cacheRateText(chTok, cmTok), '平均缓存命中率', 'c-accent',
+      (chTok + cmTok) ? '命中 ' + fmtTok(chTok) + ' · 未命中 ' + fmtTok(cmTok) : '无缓存观测样本') +
     usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
     usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
@@ -4001,9 +4010,11 @@ function remarkName(uid, nameHtml) {
   const r = remarkOf(uid);
   return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
 }
+// 返回是否真的落盘：localStorage 在隐私模式/配额满时会抛，吞掉就等于「界面说保存了、
+// 刷新后全没了」。调用方必须把 false 报出去。
 function storeRemarks(map) {
   remarksCache = map;
-  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
+  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); return true; } catch (e) { return false; }
 }
 
 /* 编辑器的行来自 overview 缓存（账号池加载过就有），另外补上「已有备注但当前列表里
@@ -4037,16 +4048,19 @@ function saveRemarkForm() {
     const v = inp.value.trim();
     if (v) map[inp.getAttribute('data-uid')] = v;
   });
-  storeRemarks(map);
+  const saved = storeRemarks(map);
   closeRemarks();
   // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
   if (view === 'accounts') loadOverview(true);
   else if (view === 'usage' && usageData) renderUsage(usageData);
-  toast('备注已保存（仅本机浏览器）');
+  toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
 }
 if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
-if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => {
+  if (!storeRemarks({})) toast('清空未能写入浏览器存储，刷新后备注会回来', 'err');
+  renderRemarkBody();
+};
 if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
 
 /* 账号身份色板（8 槽）。槽位 0 = var(--accent)（**主题主色**，浅色主题下
@@ -4830,3 +4844,173 @@ function fmtTokens(n) {
   if (n >= 1e4) return (n / 1e4).toFixed(1) + ' 万';
   return String(n);
 }
+
+
+/* ── 请求事件日志 (Keeper 风格大屏) ────────────────────────────────── */
+let rawEventsData = [];
+
+async function loadEvents() {
+  const tb = $('eventTableBody');
+  const limit = ($('eventFilterLimit') && $('eventFilterLimit').value) || 100;
+  try {
+    const res = await api('request_logs?limit=' + limit);
+    rawEventsData = res.entries || [];
+    populateEventFilterOptions(rawEventsData);
+    renderEventTable();
+  } catch (err) {
+    // 不能把失败渲染成「共 0 条事件」——归档没开和查询出错是两回事，用户得知道是哪种。
+    rawEventsData = [];
+    if ($('eventBadge')) $('eventBadge').textContent = '读取失败';
+    if (tb) setHTML(tb, '<tr><td colspan="13" style="text-align:center;padding:20px;color:var(--err);">' +
+      (err.status === 501 ? '请求归档未开启，事件日志不可用' : '读取失败: ' + esc(err.message || String(err))) + '</td></tr>');
+  }
+}
+
+function populateEventFilterOptions(list) {
+  const modelSel = $('eventFilterModel');
+  const acctSel = $('eventFilterAccount');
+  if (!modelSel || !acctSel) return;
+  const currModel = modelSel.value;
+  const currAcct = acctSel.value;
+
+  const models = new Set();
+  const accts = new Set();
+  list.forEach(e => {
+    if (e.model) models.add(e.model);
+    if (e.account) accts.add(e.account);
+  });
+
+  let mOpt = '<option value="">全部 (' + models.size + ')</option>';
+  models.forEach(m => mOpt += '<option value="' + esc(m) + '"' + (m === currModel ? ' selected' : '') + '>' + esc(m) + '</option>');
+  setHTML(modelSel, mOpt);
+
+  let aOpt = '<option value="">全部 (' + accts.size + ')</option>';
+  accts.forEach(a => aOpt += '<option value="' + esc(a) + '"' + (a === currAcct ? ' selected' : '') + '>' + esc(a) + '</option>');
+  setHTML(acctSel, aOpt);
+}
+
+function renderEventTable() {
+  const tb = $('eventTableBody');
+  if (!tb) return;
+  const modelFilter = ($('eventFilterModel') && $('eventFilterModel').value) || '';
+  const acctFilter = ($('eventFilterAccount') && $('eventFilterAccount').value) || '';
+  const statusFilter = ($('eventFilterStatus') && $('eventFilterStatus').value) || '';
+
+  let filtered = rawEventsData.filter(e => {
+    if (modelFilter && e.model !== modelFilter) return false;
+    if (acctFilter && e.account !== acctFilter) return false;
+    if (statusFilter === 'success' && !(e.ok || (e.status >= 200 && e.status < 300))) return false;
+    if (statusFilter === '429' && e.status !== 429) return false;
+    if (statusFilter === 'error' && (e.ok || (e.status >= 200 && e.status < 300))) return false;
+    return true;
+  });
+
+  if ($('eventBadge')) $('eventBadge').textContent = '共 ' + filtered.length + ' 条事件';
+
+  if (!filtered.length) {
+    setHTML(tb, '<tr><td colspan="13" style="text-align:center;padding:30px;color:var(--ink-3);">没有符合筛选条件的请求事件</td></tr>');
+    return;
+  }
+
+  const html = filtered.map(e => {
+    const d = new Date(e.time);
+    const tStr = isNaN(d) ? '-' : (String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0'));
+    const dStr = isNaN(d) ? '' : (d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate());
+
+    const acctRaw = e.account || '-';
+    const acctClean = acctRaw.replace(/\([^)]*\)/, '');
+    const mName = e.model || '-';
+    const effort = e.reasoning_effort || '-';
+
+    let resTag = '<span class="tag-badge tag-success">成功</span>';
+    if (e.status === 429) {
+      resTag = '<span class="tag-badge tag-warn">429 限流</span>';
+    } else if (e.status && (e.status < 200 || e.status >= 300)) {
+      resTag = '<span class="tag-badge tag-error">' + e.status + ' 错误</span>';
+    }
+
+    const reqProto = (e.mode === 'stream' || (e.path && e.path.includes('responses'))) ? 'SSE' : 'POST';
+    const reqPath = (e.path || '/chat').replace(/^\/v1/, '');
+
+    const durSec = ((e.duration_ms || 0) / 1000).toFixed(1) + 's';
+    const ttfbSec = e.ttfb_ms ? '首字延迟 ' + ((e.ttfb_ms) / 1000).toFixed(1) + 's' : '-';
+
+    let tpsStr = '-';
+    if (e.completion_tokens > 0) {
+      const genMs = Math.max(100, (e.duration_ms || 0) - (e.ttfb_ms || 0));
+      tpsStr = ((e.completion_tokens / genMs) * 1000).toFixed(1) + ' t/s';
+    }
+
+    const totTok = formatEventNum(e.total_tokens || 0);
+    const pTok = formatEventNum(e.prompt_tokens || 0);
+    const cTok = formatEventNum(e.completion_tokens || 0);
+    const thinkTok = e.reasoning_tokens > 0 ? ('<span class="tok-think" title="思考 Token">🧠 ' + formatEventNum(e.reasoning_tokens) + '</span>') : '';
+
+    const cHit = e.cache_hit_tokens || 0;
+    const cMiss = e.cache_miss_tokens || 0;
+    const cTot = cHit + cMiss;
+    const cRate = cTot > 0 ? ((cHit / cTot) * 100).toFixed(2) + '%' : '-';
+
+    const exec = e.executor_type || deriveEventExecutor(e.user_agent);
+    const ip = e.client_ip || '-';
+    const ua = e.user_agent || '-';
+
+    return '<tr>' +
+      '<td class="time-cell"><div class="t-time">' + esc(tStr) + '</div><div class="t-date">' + esc(dStr) + '</div></td>' +
+      '<td><div class="acct-cell"><span class="acct-icon"></span><span title="' + esc(acctRaw) + '">' + esc(acctClean) + '</span></div></td>' +
+      '<td class="model-cell"><div class="m-name">' + esc(mName) + '</div></td>' +
+      '<td><span class="pill-effort">' + esc(effort) + '</span></td>' +
+      '<td>' + resTag + '</td>' +
+      '<td><span class="req-tag">' + esc(reqProto) + '</span><div class="req-path-sub">' + esc(reqPath) + '</div></td>' +
+      '<td><div class="metric-main">' + esc(durSec) + '</div><div class="metric-sub">' + esc(ttfbSec) + '</div></td>' +
+      '<td><div class="metric-main">' + esc(tpsStr) + '</div></td>' +
+      '<td class="token-cell"><div class="tok-total">' + esc(totTok) + '</div><div class="token-breakdown"><div class="token-breakdown-row"><span class="tok-in">↑ ' + esc(pTok) + '</span></div><div class="token-breakdown-row"><span class="tok-out">↓ ' + esc(cTok) + '</span> ' + thinkTok + '</div></div></td>' +
+      '<td class="cache-cell"><div class="cache-rate">' + esc(cRate) + '</div><div class="cache-breakdown"><div><span class="cache-hit">命中 ' + esc(formatEventNum(cHit)) + '</span></div><div><span class="cache-miss">未命中 ' + esc(formatEventNum(cMiss)) + '</span></div></div></td>' +
+      '<td><span class="executor-name">' + esc(exec) + '</span></td>' +
+      '<td><code class="ip-mono">' + esc(ip) + '</code></td>' +
+      '<td><div class="ua-cell" title="' + esc(ua) + '">' + esc(ua) + '</div></td>' +
+    '</tr>';
+  }).join('');
+
+  setHTML(tb, html);
+}
+
+function formatEventNum(n) {
+  if (!n || n < 0) return '0';
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(2) + 'K';
+  return String(n);
+}
+
+function deriveEventExecutor(ua) {
+  if (!ua) return 'WorkBuddyExecutor';
+  const l = ua.toLowerCase();
+  if (l.includes('antigravity')) return 'AntigravityExecutor';
+  if (l.includes('codex')) return 'CodexExecutor';
+  if (l.includes('claude')) return 'ClaudeCodeExecutor';
+  if (l.includes('cursor')) return 'CursorExecutor';
+  if (l.includes('continue')) return 'ContinueExecutor';
+  if (l.includes('openai') || l.includes('python')) return 'OpenAIClient';
+  return 'WorkBuddyExecutor';
+}
+
+if ($('eventFilterModel')) $('eventFilterModel').onchange = renderEventTable;
+if ($('eventFilterAccount')) $('eventFilterAccount').onchange = renderEventTable;
+if ($('eventFilterStatus')) $('eventFilterStatus').onchange = renderEventTable;
+if ($('eventFilterLimit')) $('eventFilterLimit').onchange = loadEvents;
+if ($('btnEventClearFilters')) $('btnEventClearFilters').onclick = () => {
+  if ($('eventFilterModel')) $('eventFilterModel').value = '';
+  if ($('eventFilterAccount')) $('eventFilterAccount').value = '';
+  if ($('eventFilterStatus')) $('eventFilterStatus').value = '';
+  renderEventTable();
+};
+if ($('btnEventRefresh')) $('btnEventRefresh').onclick = loadEvents;
+if ($('btnEventExport')) $('btnEventExport').onclick = () => {
+  const blob = new Blob([JSON.stringify(rawEventsData, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'request-events-' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click();
+  URL.revokeObjectURL(url);
+};

@@ -187,10 +187,10 @@ type Config struct {
 
 	CN struct {
 		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
-		// https://copilot.tencent.com（internal/upstream.New 的 ChatBaseCN）。
-		// copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手直接复位，
-		// CN 模型目录与对话全部 EOF；官方 WorkBuddy 桌面端已改用 https://www.workbuddy.cn，
-		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
+		// https://www.workbuddy.cn（internal/upstream.New 的 ChatBaseCN，官方桌面端
+		// product.json 的 endpoint）。
+		// 备选入口 copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手
+		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
 		ChatBase string `json:"chat_base"`
 	} `json:"cn"`
 
@@ -242,6 +242,14 @@ type Config struct {
 		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝
 		// （只藏列表不够——知道名字仍可硬调）。面板保存后经 livecfg 热生效，无需重启。
 		Hidden []string `json:"hidden"`
+		// Allowed 对外暴露的模型白名单（issue #68）。条目语法与 Hidden 一致：
+		// 裸名=两域都允许；"cn:xxx"/"global:xxx"=只允许该域。空数组/未配置 =
+		// 白名单不启用（默认放行全部，向后兼容）。非空时仅白名单内模型可出现在
+		// /v1/models 并被点名调用，白名单外一律 400 拒绝（不打上游）。生效点在
+		// 别名映射之后（别名解析出的真实目标同样受检，不能绕过白名单）；与 Hidden
+		// 共存时取交集语义：Allowed 圈定「可能可见」集合，Hidden 仍可从中再剔除。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Allowed []string `json:"allowed"`
 		// Aliases 模型映射表（issue #30）："客户端名=真实模型名" 条目数组，与 Hidden
 		// 同存储形态（数组整体覆盖，面板删条目无需重启）。键：裸名=两域生效，
 		// "cn:x"/"global:x"=只在该域生效；键大小写不敏感。值可带 realm 前缀实现跨域
