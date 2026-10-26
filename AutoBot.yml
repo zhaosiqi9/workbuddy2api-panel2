@@ -6,6 +6,8 @@ version: 2
 upstream:
   # 逐个 clone 下来交给 agent 分析的对象。
   repos:
+    # 上游停维护后最活跃的 fork：面板资源占用优化、.deb/systemd 打包、企业微信推送都出自这里
+    - LeisureLinux/workbuddy2api-panel
     - ardeyouxipianyi/workbuddy2api-hub
     - yuechuya/WorkBuddy2API-Gateway
     - HUIdada1/AgentHub

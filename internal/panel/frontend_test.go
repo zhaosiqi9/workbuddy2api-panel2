@@ -93,7 +93,7 @@ const sandbox = new Proxy({
   addEventListener() {}, removeEventListener() {},
   matchMedia: () => ({ matches: false, addEventListener() {} }),
   setInterval, clearInterval, setTimeout, clearTimeout,
-  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, WeakMap, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
 }, { get(t, k) { return t[k]; }, has() { return true; } });
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
@@ -2194,6 +2194,7 @@ func TestAppJSAllCalledFunctionsDefined(t *testing.T) {
 	builtins := map[string]bool{
 		"Number": true, "String": true, "Boolean": true, "Array": true, "Object": true,
 		"Math": true, "JSON": true, "Date": true, "Promise": true, "Map": true, "Set": true,
+		"WeakMap": true, "WeakSet": true,
 		"RegExp": true, "Error": true, "TypeError": true, "RangeError": true,
 		"isNaN": true, "isFinite": true, "parseInt": true, "parseFloat": true,
 		"encodeURIComponent": true, "decodeURIComponent": true, "setTimeout": true,

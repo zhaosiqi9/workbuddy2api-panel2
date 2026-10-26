@@ -211,6 +211,25 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": site.Realm, "site": site.ID})
 }
 
+// logPollOnce 上游轮询结果变了才落一行日志（state 前缀 + 上游原文）。
+//
+// 为什么需要：浏览器侧报「登录失败」时，面板此前只有「发起 OAuth」一行记录——
+// code/msg 全丢在轮询里，运维无法判断是「浏览器根本没授权成功」还是「授权了但
+// 取 token 被拒」。逐轮记不行：前端 3s 一轮、最长 loginTTL，一条 state 能刷出
+// 300 行，真正的一次性错误反而被淹掉。state 已不在表里（超时 / 已落盘）则不记。
+func (p *Panel) logPollOnce(state, msg string) {
+	p.loginMu.Lock()
+	s, ok := p.logins[state]
+	if !ok || s.lastMsg == msg {
+		p.loginMu.Unlock()
+		return
+	}
+	s.lastMsg = msg
+	p.logins[state] = s
+	p.loginMu.Unlock()
+	log.Printf("panel: 登录轮询 state=%s... 上游=%s", state[:min(8, len(state))], msg)
+}
+
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
 func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
@@ -269,6 +288,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// pending（11217/12151）或其它可重试错误：面板前端继续轮询。
+		p.logPollOnce(state, err.Error())
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
 		return
 	}
@@ -298,6 +318,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		var envErr *loginEnvelopeError
 		if errors.As(errAcct, &envErr) {
 			if loginCodePending(envErr.Code) {
+				p.logPollOnce(state, errAcct.Error())
 				writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": errAcct.Error()})
 				return
 			}

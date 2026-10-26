@@ -112,6 +112,16 @@ type Scheduler struct {
 	balanceInterval atomic.Int64
 	sweepInterval   atomic.Int64
 
+	// balanceJitter/sweepJitter 周期抖动比例（千分比 0-500 = 0-50%，atomic 读写）。
+	// >0 时余额刷新/补领清扫的下一轮间隔在 ±frac×interval 内随机偏移（见 humanize.go），
+	// 不再精确固定间隔打卡。余额刷新另把账号遍历摊开（spreadStaggerDelay）。
+	balanceJitter atomic.Int64
+	sweepJitter   atomic.Int64
+
+	// nightAccountCap 夜间任务参与上限（>0 = 只让积分最高的前 N 个号参加夜猫子）。
+	// atomic 读写，Reconfigure 可热改。0 = 不限（旧行为）。
+	nightAccountCap atomic.Int64
+
 	// compGuardMu/compGuard 补偿「本期已试过」记账（key = uid + "|" + end_time）。
 	//
 	// 为什么需要：上游 compensation-status 的 claimed 字段**恒为 false**（2026-10-20 实测，
@@ -850,8 +860,16 @@ func (s *Scheduler) runKeepalive(ctx context.Context, spread, selective bool) {
 			return // ctx 取消：剩余账号下轮再续
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("WARN: keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
+			// refresh token 失效 ≠ 账号不可用：AT 还没过期时 chat 仍正常（issue #83）。
+			// 这种号既不计 session dead（连续 3 次保活就会禁用掉健康号），也不打 WARN——
+			// 面板的错误汇总按 WARN 聚合，打 WARN 会让「保活失败」一直挂在页面上。
+			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && upstream.SessionDeadButUsable(a) {
+				log.Printf("INFO: keepalive %s: refresh token 已失效但 access token 仍有效，本轮跳过（对话仍可用）",
+					logfmt.Label(st.UID, st.Nickname))
+				continue
+			}
+			log.Printf("WARN: keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
@@ -890,6 +908,12 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	// 账号级起跑错峰（人味化，humanize.go）：并发齐射改为窗口内逐号错开，
+	// 消除「同一秒全池同动作」的时间指纹。窗口量级 = frac×interval（周期抖动
+	// 关闭时为 0 = 旧行为全并发）；偏移逐号、逐轮独立——固定映射会把「每轮第
+	// i 个号」钉在同一相对位置。手动全量刷新也走这里，延迟上界 frac×interval
+	//（默认配置下 ≤ 分钟级）；未启用抖动时行为与旧版逐字一致。
+	stagger := spreadIntervalStagger(time.Duration(s.balanceInterval.Load()), s.periodicJitterFor(false))
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -899,8 +923,11 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
+		go func(a *auth.Auth, uid string, wait time.Duration) {
 			defer wg.Done()
+			if wait > 0 && !sleepCtx(context.Background(), wait) {
+				return
+			}
 			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 			if err != nil {
 				log.Printf("WARN: balance %s: %v", logfmt.Label(uid, a.Nickname), err)
@@ -924,10 +951,56 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 					log.Printf("balance-sample %s: credits=%d", uid, remain)
 				}
 			}
-		}(a, st.UID)
+		}(a, st.UID, spreadStaggerDelay(stagger, st.UID))
 	}
 	wg.Wait()
 	s.lastBalanceRefresh.Store(time.Now().UnixNano())
+}
+
+// SetJitter 热改周期抖动比例（千分比；<=0 关闭）。balance 与 sweep 各自独立。
+func (s *Scheduler) SetJitter(balancePermill, sweepPermill int) {
+	if balancePermill < 0 {
+		balancePermill = 0
+	}
+	if sweepPermill < 0 {
+		sweepPermill = 0
+	}
+	s.balanceJitter.Store(int64(balancePermill))
+	s.sweepJitter.Store(int64(sweepPermill))
+}
+
+// SetNightAccountCap 热改夜间参与上限；<0 视为 0（不限）。
+func (s *Scheduler) SetNightAccountCap(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.nightAccountCap.Store(int64(n))
+}
+
+// NightAccountCap 当前夜间参与上限。
+func (s *Scheduler) NightAccountCap() int { return int(s.nightAccountCap.Load()) }
+
+// capByCredits 夜间任务候选收窄：按积分降序取前 cap 个（余额未知/相同的顺序不稳定，
+// 但候选集每天基本不变，无需额外确定性）。cap<=0 或候选不超上限时原样返回。
+func capByCredits(list []pool.Status, cap int) []pool.Status {
+	if cap <= 0 || len(list) <= cap {
+		return list
+	}
+	sorted := append([]pool.Status(nil), list...)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].Credits > sorted[j-1].Credits; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	return sorted[:cap]
+}
+
+// periodicJitterFor 当前生效的周期抖动（千分比 → 比例）。
+func (s *Scheduler) periodicJitterFor(sweep bool) float64 {
+	if sweep {
+		return float64(s.sweepJitter.Load()) / 1000
+	}
+	return float64(s.balanceJitter.Load()) / 1000
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -947,6 +1020,12 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 		var logged time.Duration
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
+			// 人味化抖动：间隔在 ±frac×interval 内偏移（每轮重取，进程种子稳定），
+			// 不再精确固定间隔打卡。基准间隔不变（热改/暂停语义不受影响）。
+			delay := cur + periodicJitter(cur, s.periodicJitterFor(false), "bal")
+			if delay < 0 {
+				delay = 0
+			}
 			if cur != logged {
 				log.Printf("scheduler: 余额后台刷新每 %s（暂停中显示 0s）", cur)
 				logged = cur
@@ -960,7 +1039,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()

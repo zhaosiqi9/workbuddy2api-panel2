@@ -32,6 +32,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
+	"github.com/misakano7545/workbuddy2api-panel/internal/updater"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
@@ -47,6 +48,13 @@ type Config struct {
 	APIKey           string // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
 	RedisMode        string // "upstash" / "noop"，仅观测透出
 	Version          string // 面板版本号（展示用）
+	Updater          *updater.Manager
+
+	// PollIntervalSec 前端自动刷新间隔（秒）。0 = 用前端缺省值。
+	// 面板每轮刷新会重建若干表格并打一批接口；账号多、或只是开着面板当监控用
+	// 时，把间隔调大（乃至关闭）能显著降低浏览器与服务端的负担。透出到
+	// /panel/api/overview 由前端读取。
+	PollIntervalSec int
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -103,6 +111,18 @@ type Panel struct {
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
 
+	// batchRunning 手动全量运维接口（签到/旅行/活跃/保活/余额）共用的防重入闸门：
+	// 这些动作都是逐号打上游，并发跑两轮 = 每号至少翻倍上游请求，正是批间节流
+	// 要避免的场景。TryLock 语义，见 tryStartBatch。
+	batchRunning atomic.Bool
+
+	// modelsMu/modelsCache* /panel/api/models 的短 TTL 结果缓存：该接口是
+	// 「CN 目录直连 + global 目录 + 繁忙度」的实时上游聚合，前端自己都按
+	// 「很贵」在节流——服务端再兜一层，挡住异常前端循环与外部脚本。
+	modelsMu      sync.Mutex
+	modelsCacheAt time.Time
+	modelsCache   *modelsCacheEntry
+
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
@@ -155,6 +175,17 @@ func (p *Panel) unlockAccount(uid string) {
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
 
+// modelsCacheTTL 面板模型列表的结果缓存时长（测试可注入短值）。只缓存「零
+// fetchErr」的完整成功响应；部分失败的结果每次照常重探，直到拿到干净目录。
+var modelsCacheTTL = 60 * time.Second
+
+// modelsCacheEntry 一次成功聚合的结果（global_source 一并冻结——它描述的就是
+// 这份目录的来源，目录换源缓存必须跟着失效）。
+type modelsCacheEntry struct {
+	models       []map[string]any
+	globalSource string
+}
+
 // loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
 type loginSession struct {
 	created time.Time
@@ -166,6 +197,9 @@ type loginSession struct {
 	// processing 该 state 正在落盘（含签到/余额校验等副作用）。前端每 3s 轮询，而成功
 	// 分支的副作用可能耗时数秒：没有这个闸门，第二个并发 poll 会把整段流程再跑一遍。
 	processing bool
+	// lastMsg 上一次落日志的上游结果。前端每 3s 一轮、最长 loginTTL，逐轮记日志会
+	// 把 15 分钟刷成 300 行，真正的一次性错误反被淹掉；只在结果变化时记一行。
+	lastMsg string
 }
 
 // New 构建面板。
@@ -243,6 +277,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/update", p.withAuth(p.updateStatus))
+	p.mux.HandleFunc("POST /panel/api/update/check", p.withAuth(p.checkUpdate))
+	p.mux.HandleFunc("POST /panel/api/update/install", p.withAuth(p.installUpdate))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -308,17 +345,19 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		sticky = p.cfg.StickyCount()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         p.cfg.Version,
-		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
-		"redis_mode":      p.cfg.RedisMode,
-		"sticky_sessions": sticky,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"paused":          paused,
-		"in_flight_full":  inFlightFull,
+		"version":           p.cfg.Version,
+		"poll_interval_sec": p.cfg.PollIntervalSec,
+		"update":            p.updateSnapshot(),
+		"uptime_sec":        int(time.Since(p.started).Seconds()),
+		"auth_required":     p.apiKey() != "",
+		"redis_mode":        p.cfg.RedisMode,
+		"sticky_sessions":   sticky,
+		"total":             total,
+		"healthy":           healthy,
+		"cooling":           cooling,
+		"disabled":          disabled,
+		"paused":            paused,
+		"in_flight_full":    inFlightFull,
 		// 模型降级路由表：前端据它标注「⤳ 已路由至 X」（限流的模型若配了等价模型）。
 		"model_fallback": p.modelFallbackSnapshot(),
 		"accounts":       p.cfg.Pool.List(),
@@ -348,10 +387,61 @@ func (p *Panel) balanceRefreshedAt() time.Time {
 	return p.cfg.Scheduler.BalanceRefreshedAt()
 }
 
+func (p *Panel) updateSnapshot() any {
+	if p.cfg.Updater == nil {
+		return nil
+	}
+	return p.cfg.Updater.Status()
+}
+
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
 // archive_error：任务日志落盘故障（写失败不影响请求；前端可提示）。
+//
+// ?since=<RFC3339> 时只返回**该时刻之后**的条目（增量拉取）。面板「运行日志」页
+// 每 5 秒拉一次全量（500 行，~90KB），绝大多数轮次这 500 行根本没变。
+//
+// 语义与全量一致：响应仍是 {entries, archive_error}，前端把新条目追加到已有列表。
+// 游标过期时客户端自己做一次全量拉（环形缓冲淘汰最旧行时，被淘汰的行不会再来）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot(), "archive_error": p.logs.ArchiveError()})
+	entries := p.logs.Snapshot()
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		if since, ok := parseSinceParam(raw); ok {
+			filtered := entries[:0:0] // 新切片：不改 Snapshot 返回的底层数组
+			for _, e := range entries {
+				if e.TS.After(since) {
+					filtered = append(filtered, e)
+				}
+			}
+			entries = filtered
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "archive_error": p.logs.ArchiveError()})
+}
+
+// parseSinceParam 解析 ?since= 参数。
+//
+// 两种形态都要接受：
+//   - 标准 RFC3339（带时区偏移，如 2026-10-25T08:59:32.05+08:00）；
+//   - 偏移里的 "+" 被 URL 解码成空格（2026-...T08:59:32.05 08:00）——query
+//     string 里的 "+" 会被解成空格，而 RFC3339 的正偏移恰好用 "+" 表示。
+//
+// 失败一律回落全量（宁可多给不可少给），不报错。
+func parseSinceParam(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t, true
+	}
+	// "+" 被解成空格的形态：把第一个空格还原成 "+" 再试。
+	if i := strings.IndexByte(raw, ' '); i > 0 {
+		fixed := raw[:i] + "+" + raw[i+1:]
+		if t, err := time.Parse(time.RFC3339, fixed); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // errorSummary 把日志环里的 WARN/ERR 按「账号 × 类型」聚合（见 errors.go）。
@@ -370,12 +460,22 @@ func (p *Panel) errorSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 // requestMetrics 返回进程内请求指标、最近 100 条与归档状态。
+//
+// ?recent=0 时**不返回** recent 数组（只回指标与归档状态）。面板「运行日志」页在
+// 归档开启时用归档数据当请求记录表（request_logs），recent 数组用不上——但它有
+// 100 条事件（~35KB），每 5 秒白拉一次、白解析一次、白 GC 一次。这里给前端一个
+// 显式开关，让它按需索取。
 func (p *Panel) requestMetrics(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.RequestLog == nil {
 		writeErr(w, http.StatusNotImplemented, "request logger not available")
 		return
 	}
-	writeJSON(w, http.StatusOK, p.cfg.RequestLog.Snapshot())
+	snap := p.cfg.RequestLog.Snapshot()
+	// 显式 "0"/"false" 才跳过；缺省保持原行为（recent 在），避免破坏既有调用方。
+	if v := r.URL.Query().Get("recent"); v == "0" || strings.EqualFold(v, "false") {
+		snap.Recent = nil
+	}
+	writeJSON(w, http.StatusOK, snap)
 }
 
 // requestLogs 从 JSONL 归档读取最近请求；limit 默认 200、最大 1000。
@@ -491,8 +591,17 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 
 	// refresh=1：强制重探 global 目录（issue #216 现象 3）。此前按钮只是重读 1h 缓存，
 	// 上游目录变了也纹丝不动。CN 侧本来就是每请求直连上游（无缓存），无需处理。
-	if r.URL.Query().Get("refresh") == "1" {
+	refresh := r.URL.Query().Get("refresh") == "1"
+	if refresh {
 		p.cfg.Upstream.InvalidateGlobalModelsCache()
+	} else if entry := p.loadModelsCache(); entry != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"models":        entry.models,
+			"global_source": entry.globalSource,
+			"cached":        true,
+		})
+		return
 	}
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
@@ -639,14 +748,36 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
+	globalSource := p.cfg.Upstream.GlobalCatalogSource()
+	if len(fetchErrs) == 0 {
+		p.storeModelsCache(&modelsCacheEntry{models: out, globalSource: globalSource})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"models": out,
 		// global_source global 目录来源（v3-desktop / v3-union / enterprise）。
 		// 前端据此提示「拿到的是回落/降级目录」——issue #216 里用户只看到「少了 11 个模型」，
 		// 完全不知道已经降级到企业端点（那份目录只有 18 条、hy4-preview 的倍率还是旧值）。
-		"global_source": p.cfg.Upstream.GlobalCatalogSource(),
+		"global_source": globalSource,
 	})
+}
+
+// loadModelsCache 返回未过期的聚合结果；TTL 过期或从未成功过返回 nil。
+func (p *Panel) loadModelsCache() *modelsCacheEntry {
+	p.modelsMu.Lock()
+	defer p.modelsMu.Unlock()
+	if p.modelsCache == nil || time.Since(p.modelsCacheAt) >= modelsCacheTTL {
+		return nil
+	}
+	return p.modelsCache
+}
+
+// storeModelsCache 记录一次成功聚合（refresh=1 的强制重探同样刷新缓存）。
+func (p *Panel) storeModelsCache(entry *modelsCacheEntry) {
+	p.modelsMu.Lock()
+	defer p.modelsMu.Unlock()
+	p.modelsCache = entry
+	p.modelsCacheAt = time.Now()
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
@@ -932,24 +1063,53 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // 批量任务
 // ---------------------------------------------------------------------------
 
+// tryStartBatch 手动全量运维接口的防重入闸门：五个动作（签到/旅行/活跃/保活/
+// 余额）共用一把——它们都是逐号打上游，并发跑两轮 = 每号至少翻倍上游请求，正是
+// 批间节流要避免的场景（与任务中心 tryLockAccount 的 409 语义一致）。
+func (p *Panel) tryStartBatch(w http.ResponseWriter, action string) bool {
+	if !p.batchRunning.CompareAndSwap(false, true) {
+		writeErr(w, http.StatusConflict, "已有全量任务在执行中，请等待本轮完成后再触发")
+		log.Printf("panel: %s 重复触发被拒绝（已有全量任务在跑）", action)
+		return false
+	}
+	return true
+}
+
+// finishBatch 归还防重入闸门。
+func (p *Panel) finishBatch() { p.batchRunning.Store(false) }
+
 // checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
 func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
+	if !p.tryStartBatch(w, "全量签到") {
+		return
+	}
 	if p.cfg.Scheduler == nil {
+		p.finishBatch()
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
+	go func() {
+		defer p.finishBatch()
+		p.cfg.Scheduler.RunCheckinNow()
+	}()
 	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 // travelAll 手动触发全量猫猫旅行巡检（异步执行）。
 func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
+	if !p.tryStartBatch(w, "全量旅行巡检") {
+		return
+	}
 	if p.cfg.Scheduler == nil {
+		p.finishBatch()
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunTravelNow()
+	go func() {
+		defer p.finishBatch()
+		p.cfg.Scheduler.RunTravelNow()
+	}()
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -981,22 +1141,36 @@ func (p *Panel) accountTravel(w http.ResponseWriter, r *http.Request) {
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
 func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
+	if !p.tryStartBatch(w, "全量活跃上报") {
+		return
+	}
 	if p.cfg.Scheduler == nil {
+		p.finishBatch()
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunActivityNow()
+	go func() {
+		defer p.finishBatch()
+		p.cfg.Scheduler.RunActivityNow()
+	}()
 	log.Printf("panel: 手动全量活跃上报已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 // keepaliveAll 手动触发全量 token 保活（异步执行）。
 func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
+	if !p.tryStartBatch(w, "全量保活") {
+		return
+	}
 	if p.cfg.Scheduler == nil {
+		p.finishBatch()
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
+	go func() {
+		defer p.finishBatch()
+		p.cfg.Scheduler.RunKeepaliveNow()
+	}()
 	log.Printf("panel: 手动全量保活已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -1005,6 +1179,10 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 // 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
 // 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
+	if !p.tryStartBatch(w, "全量余额刷新") {
+		return
+	}
+	defer p.finishBatch()
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return

@@ -1,8 +1,10 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -201,5 +203,43 @@ func TestLoginPollPendingCodeKeepsPolling(t *testing.T) {
 	p.loginMu.Unlock()
 	if !still {
 		t.Error("pending 时不该清会话")
+	}
+}
+
+// TestLogPollOnceDedupes 覆盖轮询日志节流：同一上游结果只记一行（前端 3s 一轮，
+// 逐轮落盘会把 15 分钟刷成 300 行），结果变化后再记一行，会话消失后不再记。
+func TestLogPollOnceDedupes(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	p := New(Config{})
+	p.logins = map[string]loginSession{"st-abcdef12": {created: time.Now(), realm: "cn", site: "cn"}}
+
+	lines := func() int { return strings.Count(buf.String(), "登录轮询") }
+
+	p.logPollOnce("st-abcdef12", "code=11217 msg=login ing...")
+	p.logPollOnce("st-abcdef12", "code=11217 msg=login ing...")
+	if got := lines(); got != 1 {
+		t.Fatalf("同一上游结果记了 %d 行，want 1: %q", got, buf.String())
+	}
+	if !strings.Contains(buf.String(), "st-abcde...") {
+		t.Errorf("日志缺 state 前缀（定位要用）: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "login ing...") {
+		t.Errorf("日志缺上游原文: %q", buf.String())
+	}
+
+	p.logPollOnce("st-abcdef12", "http_error: upstream 502")
+	if got := lines(); got != 2 {
+		t.Fatalf("上游结果变化后应再记一行，got %d: %q", got, buf.String())
+	}
+
+	// 会话已清（超时 / 已落盘）：迟到的一次 poll 不该再记。
+	delete(p.logins, "st-abcdef12")
+	p.logPollOnce("st-abcdef12", "code=11217 msg=late")
+	if got := lines(); got != 2 {
+		t.Fatalf("会话消失后仍记了日志，got %d: %q", got, buf.String())
 	}
 }

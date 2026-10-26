@@ -32,7 +32,18 @@ type Config struct {
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
+		// PollIntervalSec 面板自动刷新间隔（秒）。0 = 用前端缺省（5s）；
+		// 负值 = 关闭自动刷新（只在手动操作时更新）。账号多、或只是开着面板
+		// 当监控用时，调大间隔能显著降低浏览器与服务端负担。
+		PollIntervalSec int `json:"poll_interval_sec"`
 	} `json:"panel"`
+
+	Update struct {
+		// AutoEnabled 每日按上海时间自动检查并安装原生 Release。
+		AutoEnabled bool `json:"auto_enabled"`
+		// AutoTime 自动更新时间，格式 HH:MM（Asia/Shanghai）。
+		AutoTime string `json:"auto_time"`
+	} `json:"update"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -58,6 +69,10 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// ShutdownTimeout 优雅关停窗口（SIGTERM / 更新重启时，等在途请求排干的
+		// 时限）。长流式 SSE 合法时长可达分钟级，固定 5s 必然把在途请求掐成
+		// 连接重置。缺省 "30s"；"0" = 不等待直接退。改动需重启进程。
+		ShutdownTimeout string `json:"shutdown_timeout"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -135,6 +150,21 @@ type Config struct {
 		// autoActions 白名单外的任务——它们此前除了手动一键完成没有任何补领路径。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// 周期抖动（人味化，anti-fingerprint）：>0 时余额刷新/补领清扫的每轮间隔
+		// 在 ±（值/1000）×基准间隔内随机偏移，不再精确固定间隔打卡；余额刷新
+		// 另把账号遍历摊开到同量级窗口内（见 internal/scheduler/humanize.go）。
+		// 0 = 关闭（旧行为：精确 interval ticker + 全账号并发齐射）。上限 500 = 50%。
+		// 例：balance_refresh_minutes=5 + 200 → 实际间隔在 3–7 分钟之间抖。
+		BalanceRefreshJitterPermill int `json:"balance_refresh_jitter_permill"` // 缺省 0；0–500
+		TaskSweepJitterPermill      int `json:"task_sweep_jitter_permill"`      // 缺省 0；0–500
+
+		// 夜间参与上限（人味化）：夜猫子（23:00–08:00 真实模型对话）等夜间任务的
+		// 参与账号收窄为积分最高的前 N 个，0 = 不限（旧行为全池参加）。背景：
+		// 深夜全池 12 个号在同一出口 IP 齐做真实对话，是最好认的机器人形状；真人
+		// 不会全部账号都在夜里有活动。夜猫子是唯一「整任务都是真实模型对话」的
+		// 任务，指纹最重，故只收窄它；白天任务（签到/旅行/成长）仍全池保号。
+		NightAccountCap int `json:"night_account_cap"` // 缺省 0（不限）；>0 = Top-N 按积分
 	} `json:"schedule"`
 
 	Global struct {
@@ -361,6 +391,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// ShutdownTimeoutDur 解析后的优雅关停窗口；0 = 不等待在途请求直接退。
+	ShutdownTimeoutDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -374,7 +406,9 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Server.ShutdownTimeout = "30s"
 	c.Panel.PackageDetailLimit = 5
+	c.Update.AutoTime = "04:00"
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -616,6 +650,21 @@ func applyEnv(c *Config) {
 			c.Schedule.AccountSpreadMinGapSeconds = n
 		}
 	}
+	if v := os.Getenv("WB2A_SCHEDULE_BALANCE_REFRESH_JITTER_PERMILL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.BalanceRefreshJitterPermill = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_TASK_SWEEP_JITTER_PERMILL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.TaskSweepJitterPermill = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_NIGHT_ACCOUNT_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.NightAccountCap = n
+		}
+	}
 	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Admin.Enabled = b
@@ -725,6 +774,14 @@ func (c *Config) normalize() error {
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
+	if c.Update.AutoTime == "" {
+		c.Update.AutoTime = "04:00"
+	}
+	if !isClockTime(c.Update.AutoTime) {
+		return fmt.Errorf("update.auto_time: %q 不是合法时间（HH:MM，按上海时间）", c.Update.AutoTime)
+	}
+	// PollIntervalSec 不做回落：0 = 缺省（前端 5s），负数 = 关闭自动刷新。
+	// 两者都是合法取值，normalize 必须原样保留（回落会把「关闭」变成「5 秒」）。
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
 	}
@@ -741,6 +798,17 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 优雅关停窗口：空回落 30s（分钟级在途 SSE 远比旧固定 5s 常见）；"0" 合法
+	//（立即退）；负值 fail fast。
+	if c.Server.ShutdownTimeout == "" {
+		c.Server.ShutdownTimeout = "30s"
+	}
+	if c.ShutdownTimeoutDur, err = time.ParseDuration(c.Server.ShutdownTimeout); err != nil {
+		return fmt.Errorf("server.shutdown_timeout: %q %w", c.Server.ShutdownTimeout, err)
+	}
+	if c.ShutdownTimeoutDur < 0 {
+		return fmt.Errorf("server.shutdown_timeout: 负时长 %q 无意义", c.Server.ShutdownTimeout)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
@@ -953,6 +1021,16 @@ func (c *Config) normalize() error {
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
+	// 抖动合法性（上限 50%）：非法值直接报错而非静默钳位——配置错误该在启动时暴露。
+	if c.Schedule.BalanceRefreshJitterPermill < 0 || c.Schedule.BalanceRefreshJitterPermill > 500 {
+		return fmt.Errorf("schedule.balance_refresh_jitter_permill: %d 非法（0 = 关闭，上限 500）", c.Schedule.BalanceRefreshJitterPermill)
+	}
+	if c.Schedule.TaskSweepJitterPermill < 0 || c.Schedule.TaskSweepJitterPermill > 500 {
+		return fmt.Errorf("schedule.task_sweep_jitter_permill: %d 非法（0 = 关闭，上限 500）", c.Schedule.TaskSweepJitterPermill)
+	}
+	if c.Schedule.NightAccountCap < 0 {
+		return fmt.Errorf("schedule.night_account_cap: %d 非法（0 = 不限，>0 = Top-N）", c.Schedule.NightAccountCap)
+	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
@@ -1017,6 +1095,20 @@ func checkHourRange(field, switchKey string, hours []int) error {
 		}
 	}
 	return nil
+}
+
+func isClockTime(value string) bool {
+	if len(value) != 5 || value[2] != ':' {
+		return false
+	}
+	for _, i := range []int{0, 1, 3, 4} {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	hour, errH := strconv.Atoi(value[:2])
+	minute, errM := strconv.Atoi(value[3:])
+	return errH == nil && errM == nil && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
 }
 
 func (c *Config) normalizeAlerting() error {

@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
 	"github.com/misakano7545/workbuddy2api-panel/internal/server"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
+	"github.com/misakano7545/workbuddy2api-panel/internal/updater"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
@@ -40,6 +42,33 @@ import (
 // appVersion 面板版本，透出到 /panel/api/overview。
 // 本地构建保持 dev。发布构建由 CI 用 -X 注入上海时间（2026.9.26.711），不跟上游 1.x。
 var appVersion = "dev"
+var appRepository = "misakano7545/workbuddy2api-panel"
+
+// insecureKeyWarning 空 api_key = 完全不鉴权（httpauth.VerifyBearer 对空 key 恒放
+// 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（缺省 ":7863" 绑
+// 所有网卡）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
+// 打印，安全状态返回空串。首启自动生成的随机 key 不会命中——这是给「照抄样例 /
+// 显式清空」的最后提醒，不阻塞启动。
+func insecureKeyWarning(listen, apiKey string) string {
+	if apiKey != "" && apiKey != "test_key" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = listen // 非 host:port 形态：按具名地址保守处理（继续告警）
+	}
+	switch {
+	case host == "", host == "0.0.0.0", host == "::":
+		// 空 host = 所有网卡，维持告警
+	case host == "127.0.0.1", host == "::1", strings.EqualFold(host, "localhost"):
+		return "" // 只听回环：暴露面有限，不打扰
+	}
+	what := "为空（网关与面板完全不鉴权）"
+	if apiKey != "" {
+		what = "为样例占位符 test_key"
+	}
+	return fmt.Sprintf("api_key %s，且监听 %s 非回环地址——对外无有效鉴权，请尽快修改配置里的 api_key", what, listen)
+}
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -56,10 +85,19 @@ func stateSibling(stateFile, name string) string {
 }
 
 func main() {
+	if handled, err := updater.HandleSelfUpdate(os.Args); handled {
+		if err != nil {
+			log.Printf("[updater] %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
-	// 实际生效的配置路径：下面退回「默认+env」时清空，免得启动横幅报了份没读到的文件（issue #155）。
-	loadedFrom := *cfgPath
 	flag.Parse()
+	// 实际生效的配置路径。必须在 flag.Parse() **之后**取值：flag.String 返回的指针
+	// 在 Parse 时才写入命令行值，此前取到的是默认值拷贝，-config 自定义路径时横幅
+	// 会报一份根本没读的文件。下面退回「默认+env」时清空，同理（issue #155）。
+	loadedFrom := *cfgPath
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -295,6 +333,13 @@ func main() {
 	case cfg.TaskSweepInterval > 0:
 		log.Printf("补领清扫：每 %s（只 accept 待接受的、只 claim 已达标未领的）", cfg.TaskSweepInterval)
 	}
+	if cfg.Schedule.BalanceRefreshJitterPermill > 0 {
+		log.Printf("周期抖动（人味化）：余额刷新 ±%d‰（账号遍历同步摊开）、补领清扫 ±%d‰，不再精确固定间隔（schedule.*_jitter_permill）",
+			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
+	}
+	if cfg.Schedule.NightAccountCap > 0 {
+		log.Printf("夜间参与上限：夜猫子只让积分最高的前 %d 个号参加（schedule.night_account_cap）", cfg.Schedule.NightAccountCap)
+	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
@@ -348,6 +393,10 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
+	updateManager := updater.New(appVersion, appRepository, *cfgPath, updater.Settings{
+		AutoEnabled: cfg.Update.AutoEnabled,
+		AutoTime:    cfg.Update.AutoTime,
+	})
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		Pool:       p,
@@ -366,6 +415,8 @@ func main() {
 		RedisMode:        redisMode,
 		StickyCount:      sessCount,
 		Version:          appVersion,
+		Updater:          updateManager,
+		PollIntervalSec:  cfg.Panel.PollIntervalSec,
 		Live:             live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
@@ -377,7 +428,19 @@ func main() {
 		SaveConfig: func(raw []byte) ([]string, error) {
 			configSaveMu.Lock()
 			defer configSaveMu.Unlock()
-			return saveConfig(raw, *cfgPath, live, p, up, sch, gw, pn, cfg)
+			fields, err := saveConfig(raw, *cfgPath, live, p, up, sch, gw, pn, cfg)
+			if err != nil {
+				return nil, err
+			}
+			if saved, loadErr := Load(*cfgPath); loadErr == nil {
+				updateManager.Configure(updater.Settings{
+					AutoEnabled: saved.Update.AutoEnabled,
+					AutoTime:    saved.Update.AutoTime,
+				})
+			} else if loadErr != nil {
+				log.Printf("WARN: reload update settings: %v", loadErr)
+			}
+			return fields, nil
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
@@ -397,6 +460,7 @@ func main() {
 	if cfg.Admin.AuditEnabled {
 		al, aerr := server.NewAuditLog(cfg.Admin.AuditFile, cfg.APIKey)
 		if aerr != nil {
+			p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退，否则丢整轮运行状态
 			log.Fatalf("admin audit: %v", aerr)
 		}
 		auditLog = al
@@ -439,13 +503,18 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	updateManager.SetRestart(stop)
+	go updateManager.Run(ctx)
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
 	if err := pn.StartTaskJobs(ctx, stateSibling(cfg.StateFile, "task-jobs.json")); err != nil {
+		p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退
 		log.Fatalf("task jobs: %v", err)
 	}
 	defer pn.StopTaskJobs()
 	pn.ResumeTaskJobs()
 	go sch.Run(ctx)
+	sch.SetJitter(cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
+	sch.SetNightAccountCap(cfg.Schedule.NightAccountCap)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 	if cfg.Alerting.Enabled {
@@ -493,17 +562,34 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 在途请求排干窗口可配（server.shutdown_timeout，缺省 30s）：长流式 SSE
+		// 合法时长可达分钟级，固定 5s 必然把在途请求掐成连接重置；超时不再静默。
+		shutdownTimeout := cfg.ShutdownTimeoutDur
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 5 * time.Second
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("WARN: 优雅关停未在 %s 内完成，在途请求被放弃: %v", shutdownTimeout, err)
+		}
 	}()
 
+	if warn := insecureKeyWarning(cfg.Listen, cfg.APIKey); warn != "" {
+		log.Printf("WARN: %s", warn)
+	}
 	log.Print(listenBanner(cfg.Listen, loadedFrom, cfg.APIKey))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		p.Flush() // 监听失败时信号路径不会跑：这里同样兜底落盘再退
 		log.Fatalf("http: %v", err)
+	}
+	if ctx.Err() != nil {
+		<-shutdownDone
 	}
 	log.Printf("bye")
 }
@@ -737,6 +823,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	})
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
+	sch.SetJitter(newCfg.Schedule.BalanceRefreshJitterPermill, newCfg.Schedule.TaskSweepJitterPermill)
+	sch.SetNightAccountCap(newCfg.Schedule.NightAccountCap)
 	if pn != nil {
 		pn.SetGrowthConcurrency(newCfg.Schedule.GrowthConcurrency) // 排程轮次并发热生效
 	}
@@ -800,6 +888,7 @@ func restartRequiredFields(current, next *Config) []string {
 	changed("logging.request_retention_days", current.Logging.RequestRetentionDays, next.Logging.RequestRetentionDays)
 	changed("logging.request_archive_max_mb", current.Logging.RequestArchiveMaxMB, next.Logging.RequestArchiveMaxMB)
 	changed("server.read_timeout", current.Server.ReadTimeout, next.Server.ReadTimeout)
+	changed("server.shutdown_timeout", current.Server.ShutdownTimeout, next.Server.ShutdownTimeout)
 	return out
 }
 

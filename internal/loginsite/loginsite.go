@@ -14,9 +14,12 @@ import (
 
 // ClientVersion 官方 CLI 版本。UA 与授权链接的 version 参数同源。
 //
-// 对齐 2026-10-24 的 @tencent-ai/codebuddy-code@2.174.0（npm latest）。上游目前
-// 不校验 UA 版本，但登录页会按 version 做灰度与埋点，写旧版本可能拿到旧登录页。
-const ClientVersion = "2.174.0"
+// 对齐 2026-10-26 的 @tencent-ai/codebuddy-code@2.176.0（npm dist-tag latest）。
+// 官方 CLI 把它自己的 package version 写进授权链接的 version，同时以
+// ?platform=CLI&version= 打 console/auth/risk-context —— 版本串确实会进风控判定，
+// 落后两个小版本（2.174.0，10-25 发布）时用户侧登录页按旧客户端渲染并埋点。
+// 上游 CLI 日更，这个常量要跟着 dist-tag latest 走。
+const ClientVersion = "2.176.0"
 
 // ClientUA 设备授权链路的 User-Agent（与官方 CLI 同形）。
 const ClientUA = "CLI/" + ClientVersion + " CodeBuddy/" + ClientVersion

@@ -421,6 +421,38 @@ func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 	}
 }
 
+// TestRunKeepaliveRefreshDeadButAccessTokenAlive 刷新恒回 12153、但 access token
+// 仍远未过期 → 不计 session dead，永远不会禁用（issue #83）。
+//
+// 生产实测依据：29 个账号里 4 个 refresh 恒 12153，AT 还剩 26~333 天，chat 全 200。
+// 旧行为会在连续 3 轮保活后把这种健康号禁用，面板一片橙色。
+func TestRunKeepaliveRefreshDeadButAccessTokenAlive(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":12153,"msg":"12153:refresh token failed:400 Bad Request: invalid_grant: Session doesn't have required client"}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt",
+		ExpiresAt: time.Now().Add(26 * 24 * time.Hour).Unix()}
+	p.Add(a)
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	for i := 0; i < pool.SessionDeadThreshold()+2; i++ {
+		s.RunKeepaliveNow()
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("AT 仍有效时不该禁用（refresh 死 ≠ 账号死）: %+v", st)
+	}
+	if st.SessionDeadFails != 0 {
+		t.Errorf("session dead 计数=%d want 0", st.SessionDeadFails)
+	}
+}
+
 func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)
@@ -488,6 +520,11 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 		t.Fatalf("precondition: 前 2 次不应禁用: %+v", st)
 	}
 	s.RunKeepaliveNow() // 刷新成功 → 清计数
+	// 刷新成功后 AT 有效期 1h，按 issue #83 判据这期间不累计（号确实能用）。
+	// 这里把 AT 重新标为已过期，模拟「新 token 也过期了」的下一轮，继续验计数语义。
+	a.Lock()
+	a.ExpiresAt = 1
+	a.Unlock()
 	// 接下来连续 2 次 12153：从新计数重新算，仍不应禁用（历史计数已清）。
 	s.RunKeepaliveNow() // 12153 #1（新计数）
 	s.RunKeepaliveNow() // 12153 #2（新计数）

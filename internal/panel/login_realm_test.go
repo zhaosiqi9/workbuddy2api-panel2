@@ -119,7 +119,7 @@ func TestClientUAOfficial(t *testing.T) {
 	if clientUA != loginsite.ClientUA {
 		t.Errorf("面板 UA=%q 与 loginsite.ClientUA=%q 不一致", clientUA, loginsite.ClientUA)
 	}
-	if loginsite.ClientVersion != "2.174.0" {
+	if loginsite.ClientVersion != "2.176.0" {
 		t.Errorf("官方 CLI 版本变了（%s），请同步核对登录页参数与码表", loginsite.ClientVersion)
 	}
 }

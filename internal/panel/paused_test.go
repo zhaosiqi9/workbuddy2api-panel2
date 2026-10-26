@@ -116,6 +116,7 @@ const tb = { innerHTML: '' };
 const ctx = {
   String, Number, Math, Date, Object, Array, JSON, RegExp, console,
   $: id => (id === 'accBody' ? tb : null),
+  setHTML: (el, html) => { el.innerHTML = html; },
   esc: s => String(s == null ? '' : s), dur: () => '1m', ago: () => '刚刚',
   remarkName: (uid, html) => html, // 备注是展示层增强，本测试只关心 paused 徽标/按钮
   rateLimitRowsHtml: () => '', formatTokenCount: () => '0', formatLatency: () => '-', formatRate: () => '-',
@@ -172,6 +173,7 @@ assert.ok(start >= 0, 'ML_STATE not found');
 const host = { mlBody: { innerHTML: '' }, mlNote: { textContent: '' } };
 const ctx = { Object, Array, String, RegExp,
   $: id => host[id],
+  setHTML: (el, html) => { el.innerHTML = html; },
   esc: s => String(s == null ? '' : s),
   fmtLocalDateTime: ms => 'T(' + ms + ')' };
 vm.createContext(ctx);
