@@ -424,6 +424,11 @@ func toolCallCount(resp map[string]any) int {
 	}
 	ch, _ := choices[0].(map[string]any)
 	msg, _ := ch["message"].(map[string]any)
+	// upstream.Aggregate 组包用 []map[string]any，直解上游 JSON 是 []any —— 两种都得认，
+	// 否则非流式这一半永远是 0（issue #44 的比率就会被算高一倍）。
+	if tcs, ok := msg["tool_calls"].([]map[string]any); ok {
+		return len(tcs)
+	}
 	tcs, _ := msg["tool_calls"].([]any)
 	return len(tcs)
 }

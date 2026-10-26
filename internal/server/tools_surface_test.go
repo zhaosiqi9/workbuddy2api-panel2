@@ -43,6 +43,16 @@ func TestRequestMetricsToolsSurface(t *testing.T) {
 			wantDeclared: 1, wantCalled: 1,
 		},
 		{
+			// 非流式走 upstream.Aggregate 组包，tool_calls 是 []map[string]any 而不是 []any：
+			// 只看流式用例会让这条路径的计数永远是 0（线上冒烟抓到过一次）。
+			name:    "非流式：声明了 tools 且确实调用了",
+			reqBody: `{"model":"glm-5.2","stream":false,"messages":[],` + declaredToolsBody + `}`,
+			upstream: func(string) (int, string, bool) {
+				return 200, sseToolCall, true
+			},
+			wantDeclared: 1, wantCalled: 1,
+		},
+		{
 			name:    "没声明 tools 的纯聊天不进统计",
 			reqBody: `{"model":"glm-5.2","stream":true,"messages":[]}`,
 			upstream: func(string) (int, string, bool) {
