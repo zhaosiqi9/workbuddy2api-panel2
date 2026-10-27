@@ -16,11 +16,14 @@ import (
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string              // 网关/面板共同鉴权密钥；空 = 不鉴权
-	SoftCooldown         time.Duration       // 429/限流软冷却基数（<=0 时调用方回退内置默认）
-	SanitizeFingerprints bool                // 出站请求体指纹脱敏
-	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）
-	HiddenModels         map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
+	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
+	SoftCooldown         time.Duration // 429/限流软冷却基数（<=0 时调用方回退内置默认）
+	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	// EmbeddingsEnabled 实验特性 /v1/embeddings 总开关（features.embeddings_enabled）；
+	// 默认 false，面板保存后热生效。
+	EmbeddingsEnabled bool                // 嵌入端点开关
+	RecordClientInfo  bool                // 请求日志是否记录调用来源（客户端 IP / UA）
+	HiddenModels      map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
 	// AllowedModels 模型白名单（config models.allowed，issue #68）：已归一化为
 	// "cn:x"/"global:x" 全量形式的精确 id 集合；nil = 未启用（默认放行所有模型）。
 	// 与 HiddenModels 完全对称：Hidden 是「可见集合再剔除」，Allowed 是「可能可见」集合。

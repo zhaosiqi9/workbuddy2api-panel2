@@ -353,6 +353,7 @@ func main() {
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:    cfg.Features.EmbeddingsEnabled,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 		// 模型白名单（issue #68）：归一化集合 + 启用标志；空配置 = 不启用。
@@ -522,6 +523,7 @@ func main() {
 	go sch.Run(ctx)
 	sch.SetJitter(cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
 	sch.SetNightAccountCap(cfg.Schedule.NightAccountCap)
+	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 	if cfg.Alerting.Enabled {
@@ -789,6 +791,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:    newCfg.Features.EmbeddingsEnabled,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		// 白名单热生效：与 HiddenModels 同一条快照重建通路（issue #68）。
@@ -837,6 +840,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetJitter(newCfg.Schedule.BalanceRefreshJitterPermill, newCfg.Schedule.TaskSweepJitterPermill)
 	sch.SetNightAccountCap(newCfg.Schedule.NightAccountCap)
+	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
 	if pn != nil {
 		pn.SetGrowthConcurrency(newCfg.Schedule.GrowthConcurrency) // 排程轮次并发热生效
 	}

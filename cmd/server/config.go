@@ -165,6 +165,15 @@ type Config struct {
 		// 不会全部账号都在夜里有活动。夜猫子是唯一「整任务都是真实模型对话」的
 		// 任务，指纹最重，故只收窄它；白天任务（签到/旅行/成长）仍全池保号。
 		NightAccountCap int `json:"night_account_cap"` // 缺省 0（不限）；>0 = Top-N 按积分
+
+		// MakeupCardsPerRound 每轮连登管家最多用几张补签卡，0 = 不限（补到卡用光，
+		// 即 2026-10 之前的行为）。
+		//
+		// 为什么留一个上限：补签是**会改账号历史**的写操作，一次把当月漏签全补齐
+		// （对照实现 workbuddy-scheduled-tasks 的策略是「每轮最多 1 张」，理由写明
+		// 「无卡/无断点/数据异常一律跳过，绝不瞎补」）。这里默认不动既有行为，
+		// 想保守的部署把它设成 1 即可——两轮之间还有次日签到，急不来。
+		MakeupCardsPerRound int `json:"makeup_cards_per_round"` // 缺省 0（不限）；>0 = 每轮上限
 	} `json:"schedule"`
 
 	Global struct {
@@ -235,6 +244,12 @@ type Config struct {
 		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
 		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
 		SanitizeBrandScope string `json:"sanitize_brand_scope"`
+		// EmbeddingsEnabled 实验特性：OpenAI 兼容嵌入端点 /v1/embeddings 的总开关。
+		// 默认关闭——上游嵌入只注册了 bge-m3 一个模型（1024 维），实际可用性随账号/租户
+		// 而异，且与对话模型是两套注册表，不适合默认敞开。面板保存后经 livecfg 热生效。
+		// 关闭时端点仍在，但回 403 embeddings_disabled（而不是 404：让调用方看得出
+		// 「功能存在、只是没开」，不用去猜路径拼错）。
+		EmbeddingsEnabled bool `json:"embeddings_enabled"`
 	} `json:"features"`
 
 	Models struct {
@@ -1038,6 +1053,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Schedule.NightAccountCap < 0 {
 		return fmt.Errorf("schedule.night_account_cap: %d 非法（0 = 不限，>0 = Top-N）", c.Schedule.NightAccountCap)
+	}
+	if c.Schedule.MakeupCardsPerRound < 0 {
+		return fmt.Errorf("schedule.makeup_cards_per_round: %d 非法（0 = 不限，>0 = 每轮上限）", c.Schedule.MakeupCardsPerRound)
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

@@ -73,7 +73,6 @@ upstream:
     - jin66god/workbuddy2api-panel
     - HanawaBanana/workbuddy2api
     - CangShui/workbuddy-gateway
-    - yreidev/workbuddy2api-panel
     - Practice019/multi2api
     - zhangdailin/API-Console
     - aimod-cc/agent2api
@@ -87,6 +86,40 @@ upstream:
     - L0NE-6/WorkBuddy-Daily
     - hawklithm/workbuddy2api
     - AI-Good-Tool/workbuddy-api
+    # —— 多平台合集：Trae / Qoder / MiniMax / 豆包 的 IDE 账号池与签到池，看跨平台账号模型的抽象
+    - xu20060420fan-cell/workbuddy2api-panel
+    # 三协议 + 反检测头族 + 出站代理 + Prometheus 指标；mobile.css 与 /v1/search/messages 也回移自这里
+    - jiangwanying/wb2api-panel-plus
+    # 成长中心补登 / 连登兑换 / 盲盒的**实测接口契约**（方法分工、tier 字段、client_token、need_address）
+    - Ashfmit/workbuddy-scheduled-tasks
+    # Claude Code 指纹改写的实测对照表（哪几种写法被拦、哪种放行），含 [1m] 上下文后缀判定
+    - 9Ashwin/flow-one
+    # 管理密钥与网关 Key 分离 / HttpOnly 会话 Cookie / 登录限速，安全边界写得最清楚
+    - zhuweiyou/codearts2api
+    # ESP32 看板：接口只读内存快照（采集 2s、请求路径不查库），面板侧高频读取可借鉴
+    - kevinzgai/wd-hub
+    # 同类 DSH 插件：面板只读接口契约（/v1/balance-summary、/usage、/usage/analytics）
+    - HimA6652/dsh-workbuddy2api-hub
+    # 本地桥 + 指纹策略三档（defang / neutral / pass）+ 模型权限预检（11158 不写入目录）
+    - yang9582/workbuddy-connect
+    # 三协议本地桥 + 网页控制台（启停 / 诊断 / 体检 / 对话测试），诊断面做得最全
+    - Ianzhyh/workbuddy-to-dsh
+    # 按区域分键 + 额度感知故障转移 + 幂等维护窗口（时钟偏移不重复执行）
+    - weixiaokuan123/workbuddy-proxy
+    # 少见的 /v2/embeddings 落地（bge-m3 1024 维，11351 未知模型），实验开关默认关
+    - EchoPing07/Buddy-2API-Go
+    # 九渠道合一：渠道内额度冷却与请求失败冷却分开记账，冷却期得分当 0 且路由硬剔除
+    - bluechonk/modelmux
+    # 组内加权轮询 + 虚拟模型组（客户端只点名组名，组内按权重分摊）+ 多 API Key
+    - RapidAI/RapidProxy
+    # 桌面端单 exe 形态：登录态管理 / 保活 / 猫猫旅行 / 本地网关的打包对照
+    - wbhubai/wb-desktop
+    # 35 项任务覆盖：对话类任务走免费模型省积分、新任务三路兜底（专家链 / 对话 / 通用激活）
+    - HonorC05/workbuddy-auto-checkin
+    # 多账号签到桌面端（Tauri）：积分趋势与账号切换的交互参考
+    - onlyveyou/wb-checkin
+    # 四协议接入（Claude Code / Codex / pi）+ 313 条网关测试，测试面可对照
+    - 2439810550/buddy-deck
 
   # 每片 4 个仓串行：串行是硬要求（免费档 10 RPM 共享一个池），
   # 放大每片只为少付 setup 开销（每片一次 pip install ≈2 分钟）

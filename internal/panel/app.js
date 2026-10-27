@@ -466,8 +466,7 @@ function go(v) {
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'balhist') loadBalance();
-  // 补偿状态按需拉取：compData 为空才打上游（失败留空 → 下次进入重试）。
-  if (v === 'taskscenter') { reattachQueueView(); if (!compData) loadCompensation(); }
+  if (v === 'taskscenter') reattachQueueView();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -1527,7 +1526,7 @@ const CFG_MAP = {
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   account_spread_minutes: ['schedule', 'account_spread_minutes'], account_spread_min_gap_seconds: ['schedule', 'account_spread_min_gap_seconds'],
   balance_refresh_jitter_permill: ['schedule', 'balance_refresh_jitter_permill'], task_sweep_jitter_permill: ['schedule', 'task_sweep_jitter_permill'],
-  night_account_cap: ['schedule', 'night_account_cap'],
+  night_account_cap: ['schedule', 'night_account_cap'], makeup_cards_per_round: ['schedule', 'makeup_cards_per_round'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
@@ -1545,6 +1544,7 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   sanitize_brand_scope: ['features', 'sanitize_brand_scope'],
+  embeddings_enabled: ['features', 'embeddings_enabled'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
   models_hidden: ['models', 'hidden'],
@@ -1906,12 +1906,7 @@ function refreshVisible() {
     loadOverview(true);
   }
   else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') {
-    reattachQueueView();
-    // 补偿状态只在进本视图/手动点击时取数（无 overview 快照，5s 拉一次就是打上游）；
-    // 这里只对缓存做本地重渲染，让截止倒计时继续走动。
-    renderCompensation();
-  }
+  else if (view === 'taskscenter') reattachQueueView();
 }
 // startPolling（重）建轮询定时器。间隔取 pollIntervalMs（服务端配置可调）；
 // pollAutoRefresh=false（配置为负）时不开表——只在用户手动操作时更新。
@@ -3581,7 +3576,7 @@ function applyRestToggle(body, expanded) {
 }
 
 // 收纳行展开/收起（与「积分构成」页 pkDetail 同款：查 data 行 + aria-expanded + 改按钮文案）。
-// 监听挂在 tbody 上（渲染替换 innerHTML 不会丢）；到期提醒与官方补偿共用本函数。
+// 监听挂在 tbody 上（渲染替换 innerHTML 不会丢）；到期提醒用本函数。
 // 用户选择写进 restOpen，渲染函数重建 tbody 后调 applyRestToggle 恢复。
 function bindRestToggle(id) {
   const body = $(id);
@@ -3595,7 +3590,6 @@ function bindRestToggle(id) {
   });
 }
 bindRestToggle('expBody');
-bindRestToggle('compBody');
 
 /* ── 精简 QR 编码器（券码 + 登录授权链接用）────────────────────────────
    规格子集：byte 模式、ECC L、版本 1-6（v6 两块相等，需交织）、固定掩码 0。
@@ -3832,129 +3826,6 @@ async function loadSchoolVouchers() {
 
 // 按需拉取（移植上游 8391a05）：packages 是**逐账号实时查上游**，切进本视图就打一次，
 // 账号一多既慢又压上游。有缓存先直接渲染（标注数据年龄），只有首次进入或显式刷新生效。
-/* ══ 官方补偿（上游 PR #196）：先查状态再领、带截止倒计时 ═══════════════════
-   取数与呈现分离：compData 只在进页面 / 点「检查」 / 点领取后刷新（补偿没有 overview
-   快照，挂进 5s 的 refreshVisible 就是每 5 秒打上游）；倒计时走动靠本地重渲染。 */
-let compData = null;
-const COMP_SOON_MS = 48 * 3600 * 1000;  // ≤48h 标红：补偿过期就真没了
-
-// 上游 end_time 是 "2006-01-02 15:04:05" 无时区字符串，按 +08:00 解释（同 pkExpiryMs）。
-function compEndMs(text) {
-  const t = String(text || '').trim();
-  if (!t) return null;
-  const ms = Date.parse(t.replace(' ', 'T') + '+08:00');
-  return Number.isFinite(ms) ? ms : null;
-}
-
-function compPending(r) {
-  // 布尔化：&& 链对缺字段的行会返回 undefined，进 Number() 变 NaN —— 排序比较器收到
-  // NaN 时 V8 的结果未定义（实测「待领优先」会静默失效），故这里收成 true/false。
-  return Boolean(!r.skip && !r.error && r.active && !r.claimed && (r.credit || 0) > 0);
-}
-
-function compRemainText(ms) {
-  if (ms == null) return '—';
-  const diff = ms - Date.now();
-  if (diff <= 0) return '已截止';
-  const hours = Math.floor(diff / 3600000);
-  if (hours < 48) return hours + ' 小时';
-  return Math.ceil(diff / PK_DAY_MS) + ' 天';
-}
-
-function renderCompensation() {
-  const body = $('compBody');
-  if (!body) return;
-  const rows = (compData && compData.accounts) || [];
-  const now = Date.now();
-  // 待领优先（有操作价值的先露），其余保持池顺序；20 个号一屏铺不下，只展开前 3 行。
-  rows.sort((a, b) => Number(compPending(b)) - Number(compPending(a)));
-  const COMP_HEAD = 3;
-  const rowOf = (r, hidden) => {
-      const who = esc(r.nickname || String(r.uid || '').slice(0, 8));
-      let state = '<span class="tag ok">无活动</span>';
-      if (r.skip) state = '<span class="tag">跳过：' + esc(r.skip_reason || '不适用') + '</span>';
-      else if (r.error) state = '<span class="tag bad" title="' + esc(r.error) + '">查询/领取失败</span>';
-      else if (r.claimed) state = '<span class="tag ok">已领</span>';
-      else if (compPending(r)) state = '<span class="tag warn">待领</span>';
-      const ms = compEndMs(r.end_time);
-      const soon = ms != null && ms - now <= COMP_SOON_MS;
-      const remain = r.end_time
-        ? '<span style="color:' + (soon ? 'var(--bad)' : 'var(--ink-3)') + '">' + compRemainText(ms) + '</span>'
-        : '—';
-      const act = compPending(r)
-        ? '<button class="xs" data-comp="' + esc(r.uid) + '">领取</button>' : '';
-      return '<tr' + (hidden ? ' data-exp-row="rest" hidden' : '') + '><td>' + who + '</td><td>' + state + '</td>' +
-        '<td class="num">' + (r.credit ? fmtTok(r.credit) : '—') + '</td>' +
-        '<td class="num">' + remain + '</td>' +
-        '<td class="c-acts">' + act + '</td></tr>';
-  };
-  const rest = rows.slice(COMP_HEAD);
-  body.innerHTML = !rows.length ? '<tr><td colspan="5">未查询（点「检查」）</td></tr>'
-    : rows.slice(0, COMP_HEAD).map(r => rowOf(r, false)).join('') +
-      (rest.length ? '<tr class="pk-group-summary"><td colspan="5">' +
-        '<button type="button" class="pk-group-toggle" data-exp-rest="' + rest.length +
-        '" aria-expanded="false">其余 ' + rest.length + ' 个账号，展开</button></td></tr>' +
-        rest.map(r => rowOf(r, true)).join('') : '');
-  // 重建 tbody 后恢复展开选择（本函数随 5s 轮询重渲染倒计时）。
-  applyRestToggle(body, restOpen.compBody);
-  const pend = rows.filter(compPending);
-  const sum = pend.reduce((n, r) => n + (r.credit || 0), 0);
-  const erred = Number((compData && compData.errored) || 0);
-  // 失败数必须显形：全失败时若只报「没有待领」，等于把故障说成「没活动」。
-  $('compNote').innerHTML = !compData ? ''
-    : (pend.length ? '待领 ' + pend.length + ' 个 · 合计 ' + fmtTok(sum) + ' 积分' : '无待领补偿')
-      + (erred ? ' · <span style="color:var(--bad)">' + erred + ' 个查询失败</span>' : '');
-}
-
-async function loadCompensation() {
-  if (!$('compBody')) return;
-  try {
-    compData = await api('compensation');
-  } catch (e) {
-    compData = null;
-    $('compNote').innerHTML = '<span style="color:var(--bad)">读取失败：' + esc(e.message) + '</span>';
-    return;
-  }
-  renderCompensation();
-}
-
-async function claimCompensation(uid) {
-  try {
-    const r = await api('accounts/' + encodeURIComponent(uid) + '/compensation', { method: 'POST' });
-    if (r && r.error) toast('领取失败：' + (r.skip_reason || r.error), 'bad');
-    else if (r && r.skip) toast('跳过：' + (r.skip_reason || '不适用'));
-    else toast('补偿已领取' + (r && r.credit ? ' +' + r.credit : ''));
-  } catch (e) {
-    toast('领取失败：' + e.message, 'bad');
-  }
-  await loadCompensation();
-}
-
-async function claimCompensationAll() {
-  const btn = $('btnCompAll');
-  if (btn) btn.disabled = true;
-  try {
-    const d = await api('compensation_all', { method: 'POST' });
-    const s = (d && d.summary) || {};
-    // 先看 errored 再看 claimed：上游全挂时 claimed 恒 0，只看 claimed 会把故障说成「没活动」。
-    if (s.errored) toast('补偿：' + s.errored + ' 个账号失败，已领 ' + (s.claimed || 0) + ' 个（+'
-      + (s.credit || 0) + ' 积分）', 'bad');
-    else toast('补偿：已领 ' + (s.claimed || 0) + ' 个（+' + (s.credit || 0) + ' 积分），其余无可领');
-  } catch (e) {
-    toast('全部领取失败：' + e.message, 'bad');
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-  await loadCompensation();
-}
-
-if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => loadCompensation();
-if ($('btnCompAll')) $('btnCompAll').onclick = claimCompensationAll;
-if ($('compBody')) $('compBody').addEventListener('click', ev => {
-  const btn = ev.target.closest('button[data-comp]');
-  if (btn) claimCompensation(btn.getAttribute('data-comp'));
-});
-
 let lastPackages = null, lastPackagesAt = 0, lastPkLimit = 0;
 
 // invalidatePackages 账号/凭据/余额变更后作废积分构成与到期明细缓存。

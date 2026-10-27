@@ -919,27 +919,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="qcList"></div>
       </div>
 
-      <!-- 官方补偿：带截止日的限时活动，与成长任务同属「今天要不要动手」的事，故放任务中心。
-           取数只在进入本视图 / 点「检查」 / 点领取时发生（补偿状态没有 overview 快照可吃，
-           挂进 5s 刷新就是每 5 秒打上游），倒计时走动由前端对缓存做本地重渲染。 -->
-      <div class="box">
-        <header>
-          <h3>官方补偿 <span class="hint">先查状态再领 · 无待领不发领取请求</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="compNote"></span>
-          <button class="xs" id="btnCompRefresh">检查</button>
-          <button class="xs primary" id="btnCompAll">全部领取</button>
-        </header>
-        <div class="tbl-wrap">
-        <table class="acc">
-          <thead><tr>
-            <th>账号</th><th>状态</th><th class="num">可领</th>
-            <th class="num">距截止</th><th class="c-acts"></th>
-          </tr></thead>
-          <tbody id="compBody"></tbody>
-        </table>
-        </div>
-      </div>
     </section>
 
     <!-- 模型与档位 -->
@@ -1300,6 +1279,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">夜猫子参与上限</span>
                 <input name="night_account_cap" type="number" min="0" placeholder="0">
                 <span class="hint">0 = 全池参与。&gt;0 时只在积分最高的前 N 个账号做夜间真实对话。</span></label>
+              <label class="fld"><span class="lb">每轮补签卡上限</span>
+                <input name="makeup_cards_per_round" type="number" min="0" placeholder="0">
+                <span class="hint">0 = 不限（补到卡用光）。&gt;0 时每轮连登管家最多用这么多张，剩下的漏签下一轮继续——补签会改账号历史，保守部署可设 1。</span></label>
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
@@ -1426,6 +1408,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <option value="identity">identity — 仅 system / developer</option>
               </select>
               <span class="hint">指纹脱敏总开关打开时生效。all 会改写 user / assistant / tool 历史里的同名文本；identity 只改身份消息，用户数据原样透传。</span></label>
+            <div class="switch"><span class="lb">嵌入端点 /v1/embeddings</span>
+              <input type="checkbox" name="embeddings_enabled"></div>
+            <div class="hint">实验特性，默认关闭。上游嵌入模型与对话模型是两套注册表，实测只有 <code>bge-m3</code>（1024 维）可用；
+              关闭时端点仍在但回 403 <code>embeddings_disabled</code>。改动即时生效。</div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>

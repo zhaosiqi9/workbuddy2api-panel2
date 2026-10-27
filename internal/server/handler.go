@@ -104,6 +104,10 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// EmbeddingsEnabled 实验特性 /v1/embeddings 开关的静态回退（features.embeddings_enabled）。
+	// Live 非 nil 时以热快照为准；裸用/单测路径用本字段。
+	EmbeddingsEnabled bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -114,13 +118,14 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	// 白名单静态回退（issue #68）：裸用/单测路径不依赖 Live，与 Hidden 对称。
 	allowed, enabled := livecfg.NormalizeAllowedModels(h.cfg.ModelsAllowed)
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
-		SoftCooldown:     h.cfg.SoftCooldown,
-		RecordClientInfo: h.cfg.RecordClientInfo,
-		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
-		AllowedModels:    allowed,
-		AllowlistEnabled: enabled,
-		ModelAliases:     livecfg.NormalizeModelAliases(h.cfg.ModelsAliases),
+		APIKey:            h.cfg.APIKey,
+		SoftCooldown:      h.cfg.SoftCooldown,
+		EmbeddingsEnabled: h.cfg.EmbeddingsEnabled,
+		RecordClientInfo:  h.cfg.RecordClientInfo,
+		HiddenModels:      livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		AllowedModels:     allowed,
+		AllowlistEnabled:  enabled,
+		ModelAliases:      livecfg.NormalizeModelAliases(h.cfg.ModelsAliases),
 	}
 }
 
@@ -204,6 +209,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/responses", h.withAuth(h.responsesWebsocketUnsupported))
 	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(func(w http.ResponseWriter, r *http.Request) { h.images(w, r, false) }))
 	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(func(w http.ResponseWriter, r *http.Request) { h.images(w, r, true) }))
+	// 实验特性：OpenAI 兼容嵌入（features.embeddings_enabled，默认关闭；关着时回 403）。
+	h.mux.HandleFunc("POST /v1/embeddings", h.withAuth(h.embeddings))
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
 	// 官方 agenttool 联网检索/抓页的网关透传（非对话端点，与 images 同套取号/失败处置）。
