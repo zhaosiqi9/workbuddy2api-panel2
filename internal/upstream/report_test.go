@@ -30,7 +30,8 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+	// 通道是 chatBase（5.9.3 真机 /v2/report 发往 www.workbuddy.cn），不是 billingBase。
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
 	if err := c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u-active"}, "wb2api-123", ""); err != nil {
 		t.Fatalf("report: %v", err)
 	}
@@ -50,6 +51,25 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 	if ev["mode"] != "craft" {
 		t.Errorf("mode=%v want craft", ev["mode"])
 	}
+	// 真机键集：agentName/agentType 是 cli/main（旧实现发 default/conversation），
+	// VCS 四键恒在（未知仓库为 unknown + 三个空串），buddy 段恒在。
+	if ev["agentName"] != "cli" || ev["agentType"] != "main" {
+		t.Errorf("agentName/agentType=%v/%v want cli/main", ev["agentName"], ev["agentType"])
+	}
+	if ev["source"] != "work" {
+		t.Errorf("source=%v want work", ev["source"])
+	}
+	if _, ok := ev["isMaxMode"]; !ok {
+		t.Error("缺 isMaxMode（5.9.3 真机必带）")
+	}
+	if ev["vcsType"] != "unknown" {
+		t.Errorf("vcsType=%v want unknown", ev["vcsType"])
+	}
+	for _, k := range []string{"commit", "releaseDate", "ideVersion", "machineId", "codebuddy.session_id"} {
+		if _, ok := ev[k]; !ok {
+			t.Errorf("缺设备/包指纹键 %q", k)
+		}
+	}
 	// 出站 body 必须是数组（以 [ 开头），不是单个对象。
 }
 
@@ -61,7 +81,7 @@ func TestReportChatActivityServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
 	err := c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 	if err == nil {
 		t.Fatal("want error on 500")

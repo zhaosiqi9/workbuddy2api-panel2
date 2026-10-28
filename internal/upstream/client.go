@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,8 +23,9 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
-	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -493,6 +495,30 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+// parseQueueRetryAfter 从 6020/6021 排队响应的 body 抽上游明示的重试等待
+// （data.retry_after，整数秒）。上游把排队口径放在 body 而不是 Retry-After 头
+// （2026-10-28 真机：429 + code 6020，data 含 queue_position/queue_size/
+// retry_after/estimated_wait，头侧无任何等待信息），ParseRetryAfter（只认头）
+// 拿不到。只认结构化 data 字段——msg 是 i18n 键（queue.waiting.title）无数值
+// 可解析，requestId 等恰好含数字的字段不误伤。超过 retryAfterSanity 按异常值
+// 封顶（estimated_wait 是另一个字段，不会误入；防上游口径漂移时把天文数字带回）。
+// 解析不到返回 false，调用方回落本地兜底。
+func parseQueueRetryAfter(body []byte) (time.Duration, bool) {
+	var env struct {
+		Data struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Data.RetryAfter <= 0 {
+		return 0, false
+	}
+	d := time.Duration(env.Data.RetryAfter) * time.Second
+	if d > retryAfterSanity {
+		d = retryAfterSanity
+	}
+	return d, true
+}
+
 // isAllDigits 报告 s 是否为纯数字（前置快筛，免 strconv 之后再判语义）。
 func isAllDigits(s string) bool {
 	if s == "" {
@@ -898,18 +924,27 @@ type CreditObserver func(uid string, credits int64)
 func New() *Client {
 	tr := newTransport()
 	c := &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		HTTP:     &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP: &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		// ChatBaseCN 取官方桌面端的 endpoint（product.json），不是备选入口
 		// copilot.tencent.com —— 后者是官方 NetworkFailover 里的备选，主入口才是
 		// www.workbuddy.cn。生产实测（同一账号）：/v3/config、billing 汇总、chat
 		// 三条路径两个域返回一致，workbuddy.cn 对海外出口也不复位握手（见
 		// cmd/server/config.go 的 cn.chat_base 注释）。
 		ChatBaseCN: "https://www.workbuddy.cn",
-		// BillingBaseCN 保持 www.codebuddy.cn：任务计分按「CLI 指纹在 codebuddy.cn、
-		// 桌面指纹在 chat 域、web 指纹在 workbuddy.cn」三类区分（README「任务计分」），
-		// 改这里会连带改掉 CLI 类任务的指纹来源。
-		BillingBaseCN: "https://www.codebuddy.cn",
+		// BillingBaseCN 改为 **www.workbuddy.cn**（2026-10-28，5.9.3 真机）。
+		//
+		// 客户端把 CN 侧**全部** billing / growth / activity 打到 workbuddy.cn，没有一条
+		// 打 codebuddy.cn：/v2/billing/meter/checkin-activity-status 23 条、
+		// /billing/meter/get-user-resource-{summary,free-packages,paid-packages} 12 条、
+		// /activity/growth/* 13 条、/billing/ide/trial、/billing/pay/* —— 全部 host
+		// = www.workbuddy.cn，全部 200。
+		//
+		// 旧值 codebuddy.cn 是 CodeBuddy CLI 时代的旧口径（本仓曾按「CLI 指纹在
+		// codebuddy.cn、桌面指纹在 chat 域、web 指纹在 workbuddy.cn」三分来点亮任务）。
+		// 按「以最新客户端为准」改为与客户端一致；需要退回旧口径时用
+		// config `cn.billing_base` 显式覆盖（见 cmd/server/config.go）。
+		BillingBaseCN: "https://www.workbuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
@@ -918,6 +953,29 @@ func New() *Client {
 	c.SanitizeFingerprints.Store(true)
 	c.SanitizeBrandScope.Store("all")
 	return c
+}
+
+// gzipMinChatBody 出站 chat body 触发 gzip 压缩的最小字节数。
+// 真机 body（~51 KB）带 Content-Encoding: gzip；极小 body（心跳/短补全）压了反而更长，
+// 且客户端对小请求同样不压，故设阈值而非无条件压缩。
+const gzipMinChatBody = 1024
+
+// gzipBody 用标准库 gzip 压缩出站 body（BestSpeed：客户端用 zlib 默认级别，
+// 上游不校验压缩率，只解码；BestSpeed 省 CPU 且不改变可解性）。
+func gzipBody(src []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(src); err != nil {
+		zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -1318,7 +1376,9 @@ func (c *Client) doRefresh(a *auth.Auth, rtSnapshot string) *refreshResult {
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	// body 恒为 `{}`：5.9.3 真机 refresh 请求体是 2 字节 `{}`（Content-Length: 2），
+	// 不是空 body。旧实现 nil reader → Content-Length: 0，与客户端不同。
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader("{}"))
 	if err != nil {
 		return &refreshResult{err: err, at: time.Now()}
 	}
@@ -1471,11 +1531,25 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for _, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
+		// 请求体编码：5.9.3 真机 chat body 是 **gzip 压缩**的（头 `Content-Encoding: gzip`
+		// + body 以 1f 8b 开头，Accept-Encoding 同时声明 gzip, compress, deflate, br）。
+		// 旧实现发明文 JSON，body 字节与编码头两处都与客户端不同。小 body 不压
+		// （压缩收益为负且客户端亦非一律压），阈值取 gzipMinChatBody。
+		outBody := prepared
+		gzipped := false
+		if len(outBody) >= gzipMinChatBody {
+			if z, zerr := gzipBody(outBody); zerr == nil {
+				outBody, gzipped = z, true
+			}
+		}
+		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(outBody))
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if gzipped {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
@@ -1516,6 +1590,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
+			} else if kind == ErrUpstreamBusy {
+				// 6020 排队信封的等待口径在 body（data.retry_after），不在头
+				//（见 parseQueueRetryAfter 注释）。头解析拿不到时从 body 抽，
+				// 供 handler 末端 Retry-After 上报使用。
+				if d, ok := parseQueueRetryAfter(raw); ok {
+					ue.RetryAfter = d
+				}
 			}
 			return nil, resp.StatusCode, raw, ue
 		}
@@ -1880,9 +1961,9 @@ type v3ModelPromotion struct {
 	// id+name+tags）。实测 2026-10-22：global 的 hy-image-3.5 只出现在这里、
 	// data.models 里没有——只按 models 解析会得出「国际版没有出图模型」的假
 	// 结论（实际可调：200 + usage{output_image_tokens:15000, credit:0.27}）。
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	Tags []string `json:"tags"`
+	ID    string   `json:"id"`
+	Name  string   `json:"name"`
+	Tags  []string `json:"tags"`
 	Badge *struct {
 		Label string `json:"label"`
 	} `json:"badge"`
@@ -2226,11 +2307,13 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
+	// X-Request-ID：5.9.3 真机 /v3/config 必带（9 条全有，纯随机 32 hex）。
+	req.Header.Set("X-Request-ID", session.NewTraceID())
+	// X-CodeBuddy-Request：客户端 /v3/config **不发**，故不注入（旧实现发了）。
 	if ua == "" {
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
-	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err

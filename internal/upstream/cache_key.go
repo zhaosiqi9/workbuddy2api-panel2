@@ -11,6 +11,7 @@ package upstream
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -118,6 +119,46 @@ func buildStableUUID(uid, conversation, purpose string) string {
 	var u [16]byte
 	copy(u[:], sum[:16])
 	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// buildTimeOrderedUUID 由 (uid, conversation, purpose) 稳定派生一个 **UUIDv7 形态**的
+// 36 字符值（48 bit 时间位 + 版本 7 + RFC 4122 变体位）。
+//
+// 为什么会话类 ID 必须 v7 而不是 v4：5.9.3 真机 X-Conversation-ID / acp-connection-id
+// 恒为 `01a1815d-dacf-75f1-…`（第 13 位恒 7、前 48 bit 解出该次操作时刻，见
+// session.NewTimeOrderedID 的取证注释）。派生分支若摆 v4 位（第 13 位 4），是**与真机
+// 相反**的形态特征——比「不走派生」更容易被判别。cn_contract_test 的 uuidV7Re 钉这条。
+//
+// 稳定性与伪时间位：时间位不能取 time.Now()，否则同一 (账号, 会话) 每轮换值、前缀缓存
+// 槽全废。故 48 bit 时间位也做成**哈希派生的伪时间**：锚定 2026-01-01，24 个月窗口，
+// 落点由 sha256(uid|conv|purpose) 决定 —— 同签名恒同值，解出来是合理的历史时刻，
+// 不是越界到 1974/5000 年那种一眼假的值（上游若解码时间位也看不出破绽）。
+//
+// 注：prompt_cache_key 仍走 buildStableUUID（v4 形态），刻意不改——那一侧无真机对照，
+// 改了等于让存量会话的前缀缓存槽整体漂移一次。头部族（X-Conversation-ID /
+// acp-connection-id）改 v7 后同样会有一次性的槽位重暖，之后照旧稳定。
+func buildTimeOrderedUUID(uid, conversation, purpose string) string {
+	in := uid + "|" + conversation
+	if purpose != "" {
+		in += "|" + purpose
+	}
+	sum := sha256.Sum256([]byte(in))
+	const (
+		anchorMS = int64(1767225600000)                 // 2026-01-01T00:00:00Z
+		windowMS = int64(24 * 30 * 24 * 60 * 60 * 1000) // ≈24 个月
+	)
+	ms := uint64(anchorMS + int64(binary.BigEndian.Uint64(sum[8:16])%uint64(windowMS)))
+	var u [16]byte
+	u[0] = byte(ms >> 40)
+	u[1] = byte(ms >> 32)
+	u[2] = byte(ms >> 24)
+	u[3] = byte(ms >> 16)
+	u[4] = byte(ms >> 8)
+	u[5] = byte(ms)
+	copy(u[6:], sum[:10])
+	u[6] = (u[6] & 0x0f) | 0x70 // version 7
 	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }

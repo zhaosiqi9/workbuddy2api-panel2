@@ -1140,6 +1140,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	// X-Root-Request-ID：真机语义是「会话根请求 ID」（整会话复用），不是轮级聚合主键。
+	// 网关的会话级稳定值就是 sessKey 派生的 ID —— 有粘性会话键时用它当根，
+	// 否则留空（injectConversationHeaders 回落轮级值，头不丢）。
+	if sessKey != "" {
+		chatMeta.RootRequestID = session.RequestIDForKey("root:" + sessKey)
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
@@ -1412,29 +1418,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 6021「queue.full.title」渠道级容量满载：不罚号不轮转，立即透传上游原文
-			//（503 + upstream_busy，含 requestId）。上游集群排队打满时换任何账号都撞
-			// 同一堵墙——按限流处置会逐号软冷却、与全冷却兜底互相喂成整池停摆
-			//（2026-10-15 实案：18 次全落 soft_rate），且换号把无效请求放大
-			// MaxRotate 倍。客户端按 SDK 退避重试即可；Retry-After 是本地兜底
-			//（上游未给重置口径时按 5s 提示，PR #180 同款）。
+			// 6020「queue.waiting.title」/6021「queue.full.title」渠道级排队/容量满载：
+			// **不罚号**（保留 1e70717/b0797d7 的核心修正——上游容量信号与账号无关，
+			// 按 ErrSoftRate 罚号会与全冷却兜底互相喂成整池停摆，2026-10-15 实案），
+			// 但恢复**请求内轮转**，终态映射见末端 ErrUpstreamBusy 分支（429 + Retry-After）。
+			//
+			// 为什么轮转回来了：排队可用性是**间歇的**——2026-10-28 生产实案（多号池，
+			// kimi-k3.1-pro）同一分钟内既有 6021 也有成功（16:38 两号连续 6021 后 33s
+			// 内同模型即恢复），一次性 fail-fast 把几秒的抖动直接交给客户端。队列按
+			// client_user_type 全局共享（实测 position 2502→2648，9s 涨 146），换号
+			// 通常只是多一次撞墙、无法绕过排队本身——所以这里轮转的价值不在「绕过」，
+			// 而在间歇空窗不再逐请求致命；代价是 MaxRotate 次上游调用，客户端按
+			// Retry-After 重试的节奏下有界。
+			//
+			// 为什么终态回 429 而不是 503：上游对这两个形态本身回的就是 429（6020 还
+			// 带 data.retry_after=40），网关改写成 503 等于把「稍后再试」翻译成「服务
+			// 不可用」——WorkBuddy CLI 对 429 按 Retry-After 自动重试（官方排队语义），
+			// 对 503 直接中断任务（2026-10-28 实案：任务在两次 503 后死亡）。透传上游
+			// 原状态，让下游用自己的重试策略消化排队。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				msg := string(respBody)
-				if strings.TrimSpace(msg) == "" {
-					msg = "upstream capacity is full (queue.full); retry after a short wait"
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（排队满载换号退避）
 				}
-				retryAfter := "5"
-				if uerr != nil && uerr.RetryAfter > 0 && int64(uerr.RetryAfter.Seconds()) > 0 {
-					retryAfter = strconv.FormatInt(int64(uerr.RetryAfter.Seconds()), 10)
-				}
-				w.Header().Set("Retry-After", retryAfter)
-				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_busy", msg,
-					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
-				st.status = http.StatusServiceUnavailable
-				st.outcome = reqlog.OutcomeHTTPError
-				return
+				continue
 			}
 			// 11148「tool calls and tool results do not match」：请求内容级配对断裂。
 			// 上游明示「直接重试无效，请新建任务」——同一 body 换任何账号都撞同一处，
@@ -1746,12 +1755,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
 		case upstream.ErrUpstreamBusy:
-			// 6021 渠道级容量满载（防御路径：正常已在轮转循环内 fail-fast，本分支
-			// 只在异常流经末端时兜底）。503 + 可重试语义，上游原文（下方统一透传）
-			// 含 requestId。
-			status = http.StatusServiceUnavailable
+			// 6020/6021 渠道级排队/容量满载：轮转已耗尽（本请求每个号都撞同一堵墙）。
+			// 回 429 + Retry-After（上游 data.retry_after，缺省 5s，封顶 maxRetryAfterSec）
+			// 而不是 503：上游对这两个形态本身回 429（6020 带 retry_after=40），透传
+			// 原状态让下游按 OpenAI 限流语义重试——WorkBuddy CLI 对 429 自动睡后重发
+			//（官方排队语义），对 503 直接中断任务（2026-10-28 生产实案）。上游原文
+			//（requestId / queue_position）仍在 message 原样透传，供客户端日志定位。
+			status = http.StatusTooManyRequests
 			code = "upstream_busy"
-			msg = "upstream capacity is full (queue.full); retry after a short wait"
+			msg = "upstream queue is full; retry after a short wait"
+			if ue.RetryAfter > 0 {
+				if secs := int(math.Ceil(ue.RetryAfter.Seconds())); secs > 0 {
+					retryAfterSec = secs
+					if retryAfterSec > maxRetryAfterSec {
+						retryAfterSec = maxRetryAfterSec
+					}
+				}
+			}
+			if retryAfterSec == 0 {
+				retryAfterSec = 5 // 上游未给口径时的本地兜底（沿用旧 fail-fast 分支的 5s）
+			}
 		case upstream.ErrHardCredit:
 			// 14018/402：积分耗尽。429 + insufficient_quota，message 优先上游
 			// 原文（含购买链接；下方统一覆盖）。
@@ -2255,11 +2278,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
 	case upstream.ErrUpstreamBusy:
-		// 6021「queue.full.title」渠道级容量满载：账号余额健康、未限流、session
-		// 未死，换号也撞同一堵墙。零动作（不冷却/不熔断/不 NoteError/不喂连败，
-		// 同 ErrContentBlocked 待遇）——一旦按 ErrSoftRate 罚号，会与全冷却兜底
-		// 互相喂成整池停摆（2026-10-15 实案）。chatCompletions 已 fail-fast 503
-		// 透传原文、终止轮转——该分支只为文档完备。
+		// 6020「queue.waiting.title」/6021「queue.full.title」渠道级排队/容量满载：
+		// 账号余额健康、未限流、session 未死，换号也撞同一堵墙。零动作（不冷却/
+		// 不熔断/不 NoteError/不喂连败，同 ErrContentBlocked 待遇）——一旦按
+		// ErrSoftRate 罚号，会与全冷却兜底互相喂成整池停摆（2026-10-15 实案）。
+		// chatCompletions 轮转耗尽后走末端 ErrUpstreamBusy 分支回 429 + Retry-After，
+		// 不罚号原则在此保持不变。
 	case upstream.ErrToolMismatch:
 		// 11148 工具配对断裂：请求内容的问题（会话历史里的 tool_calls / tool 结果对不上），
 		// 同一 body 换任何账号都是同样的拒绝。零动作（不冷却/不熔断/不 NoteError/不喂

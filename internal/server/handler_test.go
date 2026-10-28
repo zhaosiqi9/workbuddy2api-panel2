@@ -243,13 +243,18 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
-// TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
-// 是渠道级准入队列满（上游容量信号），不是账号问题。2026-10-15 实案：按 ErrSoftRate
-// 处置会逐号软冷却，与全冷却兜底互相喂（兜底把冷却号再送上游，再撞 6021 又续订），
-// 几秒的排队放大成整段时间全量 429（本仓当日 18 次全落 soft_rate）。端到端断言：
-// 不轮转（只打一次上游）、直接回 503 + upstream_busy + 上游原文在场、
-// Retry-After 本地兜底 5s、账号零惩罚。
-func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
+// TestChatQueueBusyRotatesThen429WithoutPenalty 上游 429 + code 6020/6021
+// 「渠道级排队/容量满载」是上游容量信号，不是账号问题。2026-10-15 实案的教训
+// 保留：罚号（ErrSoftRate 处置）会逐号软冷却、与全冷却兜底互相喂，几秒的排队
+// 放大成整段时间全量 429——所以**零惩罚**不变。2026-10-28 生产实案修正两点：
+//   - 恢复请求内轮转：排队可用性间歇（同一分钟内既有 6021 也有成功），一次性
+//     fail-fast 把抖动直接交给客户端；
+//   - 末端回 429 + Retry-After 而非 503：上游本身回 429，WorkBuddy CLI 对 429
+//     按 Retry-After 自动重试、对 503 直接中断任务。
+//
+// 端到端断言：轮转打满两个号（各一次）、429 + Retry-After 本地兜底 5s、
+// 上游原文在场、账号零惩罚。
+func TestChatQueueBusyRotatesThen429WithoutPenalty(t *testing.T) {
 	const upstreamBody = `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -265,22 +270,43 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503 fail-fast，非 429)", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s (want 429，轮转耗尽后的可重试语义，非 503)", rec.Code, rec.Body)
 	}
 	if !strings.Contains(rec.Body.String(), "6021") || !strings.Contains(rec.Body.String(), "b1bc87ea") {
-		t.Errorf("503 body 应透传上游原文（含 code+requestId）: %s", rec.Body)
+		t.Errorf("429 body 应透传上游原文（含 code+requestId）: %s", rec.Body)
 	}
 	if ra := rec.Header().Get("Retry-After"); ra != "5" {
 		t.Errorf("Retry-After=%q want 5（上游未给重置口径时的本地兜底）", ra)
 	}
-	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
-		t.Errorf("calls=%v want 只打一次上游、busy2 号 0 次（不轮转）", calls)
+	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 1 {
+		t.Errorf("calls=%v want 两号各一次（轮转、tried 不重复选号）", calls)
 	}
 	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal（ErrSoftRate 会冷却+喂 streak）。
 	st, _ := p.Status("busy1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 || st.SoftStreak != 0 {
 		t.Errorf("ErrUpstreamBusy must not penalize account: %+v", st)
+	}
+}
+
+// TestChatQueueWaitingRetryAfterFromBody 6020「queue.waiting」的重试口径在 body
+// （data.retry_after=40，实测真机形态：头侧无 Retry-After），末端 429 的 Retry-After
+// 必须取到 40 而不是本地兜底 5——WorkBuddy CLI 把该头当「睡多久」的指令执行，
+// 差 35s 直接决定客户端的排队节奏是否与上游一致。
+func TestChatQueueWaitingRetryAfterFromBody(t *testing.T) {
+	const upstreamBody = `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, upstreamBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "q1", AccessToken: "at-q1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429 (body=%s)", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "40" {
+		t.Errorf("Retry-After=%q want 40（data.retry_after 透传，非本地兜底）", ra)
 	}
 }
 

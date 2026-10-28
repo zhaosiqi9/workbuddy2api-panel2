@@ -73,27 +73,40 @@ func TestInjectConversationFields_BadJSON(t *testing.T) {
 // TestACPConnectionIDShape acp-connection-id 必须与会话 ID 同形但不同值：
 // 官方在 applyGatewayHeaders 里把它与 X-Conversation-ID 并列设置，值来自会话注册表
 // （每 session 一个，同会话稳定、跨会话不同）。
+//
+// 2026-10-28 修正形态：此前断言的是 UUID v4（`xxxx-4xxx`），而真机两者都是
+// **UUIDv7**（`01a1815d-dacf-75f1-…`，第 13 位恒 7、前 48 bit 是操作时刻）——
+// 派生值摆 v4 位是与真机相反的形态特征，故改走 buildTimeOrderedUUID。
 func TestACPConnectionIDShape(t *testing.T) {
 	uid, conv := "85329a86-a3e7-448a-9666-ec34e0bdfb67", "conv-1"
-	sess := buildCacheKey(uid, conv)
-	acp := buildStableUUID(uid, conv, "acp")
+	sess := buildCacheKey(uid, conv)               // prompt_cache_key 槽（v4，历史值零漂移）
+	convHdr := buildTimeOrderedUUID(uid, conv, "") // X-Conversation-ID 派生形态
+	acp := buildTimeOrderedUUID(uid, conv, "acp")  // acp-connection-id
 	uuid4 := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	if !uuid4.MatchString(acp) {
-		t.Fatalf("acp-connection-id 必须 UUID v4 形态: %q", acp)
+	for name, got := range map[string]string{"X-Conversation-ID": convHdr, "acp-connection-id": acp} {
+		if !uuid7.MatchString(got) {
+			t.Fatalf("%s 必须 UUIDv7 形态（真机恒 01a1815d-…）: %q", name, got)
+		}
 	}
-	if acp == sess {
+	if !uuid4.MatchString(sess) {
+		t.Fatalf("buildCacheKey 应保持 v4 形态（prompt_cache_key 槽位不漂移）: %q", sess)
+	}
+	if acp == convHdr {
 		t.Fatal("acp-connection-id 不能与会话 ID 同值（官方是两个独立值）")
 	}
 	// 同 (账号, 会话) 稳定
-	if again := buildStableUUID(uid, conv, "acp"); again != acp {
+	if again := buildTimeOrderedUUID(uid, conv, "acp"); again != acp {
 		t.Fatalf("acp-connection-id 不稳定: %q vs %q", acp, again)
 	}
 	// 跨会话不同
-	if other := buildStableUUID(uid, "conv-2", "acp"); other == acp {
+	if other := buildTimeOrderedUUID(uid, "conv-2", "acp"); other == acp {
 		t.Fatal("不同会话不该共用 acp-connection-id")
 	}
-	// purpose 为空时与历史 buildCacheKey 逐字节一致（缓存槽零漂移）
+	// purpose 为空时与 buildCacheKey 的**输入**一致（同签名，只是位布局不同 → 值不同是预期的）
 	if buildStableUUID(uid, conv, "") != sess {
 		t.Fatal("buildStableUUID(purpose=\"\") 必须等于 buildCacheKey")
 	}
 }
+
+// uuid7 v7 形态正则（与 cn_contract_test.go 的 uuidV7Re 同义，此处独立便于单测引用）。
+var uuid7 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)

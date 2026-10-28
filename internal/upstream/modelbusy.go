@@ -20,6 +20,7 @@ import (
 	"net/http"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -45,8 +46,28 @@ func (c *Client) ModelBusy(a *auth.Auth, models []string) (map[string]string, er
 		if err != nil {
 			return out, err
 		}
+		// 头族按 5.9.3 真机 /v2/chat/busy 逐头对齐——**不是** chat 那套重头族：
+		//
+		//	Accept: application/json, text/plain, */*
+		//	Content-Type: application/json
+		//	User-Agent: WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+		//	X-Request-ID / X-Product: SaaS / Authorization / X-User-Id / X-Domain
+		//
+		// 真机这条路径**不发** X-Conversation-* / acp-connection-id / baggage / b3 /
+		// x-stainless-* / x-codebuddy-request，也没有 X-Requested-With。旧实现直接复用
+		// ChatHeaders，等于给一个官方轻请求套上 20 多个它从不发的头。
+		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("Content-Type", "application/json")
-		c.ChatHeaders(req, a, "", ChatMeta{})
+		req.Header.Set("User-Agent", c.userAgent(a))
+		req.Header.Set("X-Request-ID", session.NewTraceID()) // 真机为纯随机 32 hex（无时间前缀）
+		req.Header.Set("X-Product", "SaaS")
+		if at := a.AccessTokenValue(); at != "" {
+			req.Header.Set("Authorization", "Bearer "+at)
+		}
+		if a.UID != "" {
+			req.Header.Set("X-User-Id", a.UID)
+		}
+		req.Header.Set("X-Domain", c.chatHost(a))
 		data, err := c.doJSON(req)
 		if err != nil {
 			return out, err

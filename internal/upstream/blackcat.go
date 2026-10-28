@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
-	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
 // InNightWindow 当前是否处于夜猫子计数窗口（23:00–08:00 CST：上游按自然日计时）。
@@ -53,7 +53,9 @@ func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
 			"messages": []map[string]any{{"role": "user", "content": "1+1等于几？直接回答。"}},
 			"stream":   true,
 		})
-		rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{})
+		// AgentType=auxiliary：这不是用户对话，是网关自发的「夜猫子」保活对话，
+		// 真机里非主对话的模型调用自报 auxiliary（见 ChatMeta.AgentType）。
+		rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{AgentType: AgentTypeAuxiliary})
 		if err != nil || status >= 400 {
 			if rc != nil {
 				rc.Close()

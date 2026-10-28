@@ -20,8 +20,10 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
-// 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组，默认伪造桌面端指纹）；
+// chat/refresh 路径 UA=默认 WorkBuddy 三段式；activities 上报（/v2/report）自
+// 2026-10-28 起改走 **chatBase**，UA 也随之变成同样的三段式——5.9.3 真机 /v2/report
+// 实测 UA 是 `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`，不是 billing 的 axios。
+// 真正的 billing 端点（checkin / balance / 明细）仍走 axios/1.16.1（billingUA）。
 // 显式 client_name="SaaS" 才还原"billing 不设 UA"的旧行为。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
@@ -44,11 +46,12 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			wantUA: defaultUAString,
 		},
 		{
-			name: "billing_report",
+			// /v2/report 走 chat 域，UA 用 WorkBuddy 三段式（真机口径）。
+			name: "chat_report",
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: billingUAWorkBuddy,
+			wantUA: defaultUAString,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,9 +163,9 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	defaultUAString      = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.161.0"
+	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.165.0"
 	billingUAWorkBuddy   = "axios/1.16.1"
 	billingUACustomVer   = "axios/1.16.1"
 	billingUAAgentString = "BillingAgent/1"

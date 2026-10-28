@@ -202,6 +202,12 @@ type Config struct {
 		// 备选入口 copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手
 		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
 		ChatBase string `json:"chat_base"`
+		// BillingBase 国内 billing/growth 上游 base 覆盖；空 = 内置默认
+		// https://www.workbuddy.cn（2026-10-28 起对齐 WorkBuddy 5.9.3 客户端：
+		// 客户端把 CN 全部 billing/activity 都打到 workbuddy.cn）。
+		// 旧口径是 www.codebuddy.cn（CodeBuddy CLI 时代，按 CLI 指纹点亮任务用），
+		// 需要退回时填 "https://www.codebuddy.cn"。
+		BillingBase string `json:"billing_base"`
 	} `json:"cn"`
 
 	Upstream struct {

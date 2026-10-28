@@ -976,7 +976,9 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 		},
 		"stream": true,
 	})
-	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{})
+	// AgentType=auxiliary：面板自发的一次判据对话，不是用户在面板里手打的主对话，
+	// 真机对非主对话的模型调用自报 auxiliary（见 upstream.ChatMeta.AgentType）。
+	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{AgentType: upstream.AgentTypeAuxiliary})
 	if err != nil {
 		return "", fmt.Errorf("对话请求: %w", err)
 	}

@@ -904,11 +904,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	return restartRequiredFields(baseline, newCfg), nil
 }
 
-// applyCNChatBase 把 config cn.chat_base 装配进上游 client；空则保留内置默认，
-// 老配置（无 cn 段）行为不变。
+// applyCNChatBase 把 config cn.chat_base / cn.billing_base 装配进上游 client；
+// 空则保留内置默认，老配置（无 cn 段）行为不变。
 func applyCNChatBase(up *upstream.Client, cfg *Config) {
 	if cfg.CN.ChatBase != "" {
 		up.ChatBaseCN = cfg.CN.ChatBase
+	}
+	if cfg.CN.BillingBase != "" {
+		up.BillingBaseCN = cfg.CN.BillingBase
 	}
 }
 
@@ -936,8 +939,9 @@ func restartRequiredFields(current, next *Config) []string {
 	changed("upstream.device_token", current.Upstream.DeviceToken, next.Upstream.DeviceToken)
 	changed("upstream.device_token_file", current.Upstream.DeviceTokenFile, next.Upstream.DeviceTokenFile)
 	changed("upstream.passthrough_ip", current.Upstream.PassthroughIP, next.Upstream.PassthroughIP)
-	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
+	// cn.chat_base / cn.billing_base 同样只在装配期写进上游 client（请求路径并发读取，不做热改）。
 	changed("cn.chat_base", current.CN.ChatBase, next.CN.ChatBase)
+	changed("cn.billing_base", current.CN.BillingBase, next.CN.BillingBase)
 	changed("global.enabled", current.Global.Enabled, next.Global.Enabled)
 	changed("global.chat_base", current.Global.ChatBase, next.Global.ChatBase)
 	changed("global.billing_base", current.Global.BillingBase, next.Global.BillingBase)

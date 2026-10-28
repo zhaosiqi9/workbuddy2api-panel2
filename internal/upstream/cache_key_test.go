@@ -141,7 +141,9 @@ func TestChatMetaCacheKeySource(t *testing.T) {
 		// 即 400 code=11-128 "conversation id missing"）——现造 32 hex，值不可预知，只断言非空。
 		wantConvAny bool
 	}{
-		{"仅粘性键", ChatMeta{CacheKeyID: "sess-abc"}, buildCacheKey("u1", "sess-abc"), buildCacheKey("u1", "sess-abc"), false},
+		// X-Conversation-ID 派生分支的形态是 UUIDv7（真机恒 01a1815d-…），与
+		// prompt_cache_key 的 v4 槽键不同函数、不同值（2026-10-28 形态修正）。
+		{"仅粘性键", ChatMeta{CacheKeyID: "sess-abc"}, buildCacheKey("u1", "sess-abc"), buildTimeOrderedUUID("u1", "sess-abc", ""), false},
 		{"客户端会话优先", ChatMeta{ConversationID: "conv-1", CacheKeyID: "sess-abc"}, buildCacheKey("u1", "conv-1"), "conv-1", false},
 		{"两源皆空", ChatMeta{}, buildCacheKey("u1", ""), "", true},
 	} {

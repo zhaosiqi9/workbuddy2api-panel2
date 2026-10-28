@@ -49,14 +49,20 @@ const (
 	// **按 realm 分开**（2026-10-20 双版本抓包实测）：两版上报的版本三元组不同，
 	// 且 commit/releaseDate 是打包期常量、无法从版本号推导：
 	//
-	//	CN 5.8.3    ideVersion 5.8.3 commit db0e9b51b7fa… releaseDate 1792029498676
+	//	CN 5.9.3    ideVersion 5.9.3 commit d4692421… releaseDate 1793093056315
 	//	global 5.8.4 ideVersion 5.8.4 commit 73952edb48da… releaseDate 1792063084107
+	//
+	// CN 三元组在 2026-10-28 按 5.9.3 真机 /v2/report 重新采集（commit / releaseDate /
+	// ideVersion / extVersion 逐字取自 7 条上报事件，与分发包 cli/product.json 的
+	// commit + date 交叉一致）：
+	//   commit      = d46924219e79332f49c37ccebf27292f87001b19
+	//   releaseDate = 1793093056315
 	//
 	// 此前不分档、恒用 global 的三元组，等于给每个国内号都盖了国际版的包指纹
 	// （版本号与安装清单自相矛盾），是最容易被设备侧写识破的一处。
-	desktopVersionCN         = "5.8.3"
-	desktopCommitCN          = "db0e9b51b7fa0b383f41f5b0b83dd442c8557918"
-	desktopReleaseDateCN     = int64(1792029498676)
+	desktopVersionCN         = "5.9.3"
+	desktopCommitCN          = "d46924219e79332f49c37ccebf27292f87001b19"
+	desktopReleaseDateCN     = int64(1793093056315)
 	desktopVersionGlobal     = "5.8.4"
 	desktopCommitGlobal      = "73952edb48da46bd0b244661efe22f4f247c4977"
 	desktopReleaseDateGlobal = int64(1792063084107)
@@ -66,8 +72,8 @@ const (
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
 // desktopUAFor 桌面端 UA：两段品牌一致（与业务链路同源，都是 SDK 的 buildUserAgent）。
-// CN → `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`；
-// global → `workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`。
+// CN 5.9.3 → `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`（真机实测）；
+// global 5.8.4 → `workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0`。
 func desktopUAFor(a *auth.Auth) string {
 	ver, _, _ := desktopTriple(a)
 	brand := uaBrandFor(a)
@@ -177,6 +183,8 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	// X-Requested-With：5.9.3 真机 /v2/report 必带（旧实现漏了，缺头即「非客户端形态」）。
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("User-Agent", desktopUAFor(a))
 	// X-Domain 是**主机名**不是 URL：真机实测 `X-Domain: www.workbuddy.ai`，
 	// 而 desktopBase 返回的是带 scheme 的 base，直接塞进去会发成

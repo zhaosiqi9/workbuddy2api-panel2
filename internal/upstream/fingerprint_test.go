@@ -1,4 +1,4 @@
-// fingerprint_test.go 官方客户端指纹对齐真机（5.8.4 国际版 / 5.8.3 国内版）的回归。
+// fingerprint_test.go 官方客户端指纹对齐真机（国内 5.9.3 / 国际 5.8.4）的回归。
 //
 // 证据来源：2026-10-20 桌面客户端真实启动流量（mitmproxy 抓到 www.workbuddy.ai
 // 183 条请求）+ 客户端 app.asar / cli/dist 静态反编译。以下每个断言都对应一处
@@ -23,15 +23,16 @@ func globalAuth() *auth.Auth {
 }
 
 // v3ProbeUACNForTest 国内版 /v3/config 实测 UA（默认 Client、CN 账号）。
-// 2026-10-20 抓包：`WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`。
-const v3ProbeUACNForTest = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+// 2026-10-28 国内 5.9.3 抓包：`WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`
+// （带鉴权的三条 /v3/config 全是三段式；未鉴权那条是两段式 `WorkBuddy/5.9.3 CLI/2.165.0`）。
+const v3ProbeUACNForTest = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 
 // TestUARealmBrand 首段恒驼峰 WorkBuddy，只有第二段品牌随 realm 变。
 //
 // 2026-10-21 国际版 5.8.4 GUI 真机抓包（/v2/chat/completions 主对话 + 标题生成）：
 //
-//	CN 5.8.3     → WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0     （28 路径）
-//	global 5.8.4 → WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0  （chat 链路实测）
+//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0     （7 条 chat 实测）
+//	global 5.8.4 → WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0  （chat 链路实测）
 //
 // 关键：首段永远是驼峰 `WorkBuddy`——官方 chat 走 OpenAI SDK 的 buildUserAgent，
 // 首段取 productName 原样，第二段才是打包期改写的 slug。曾把 global 首段也写成
@@ -40,10 +41,10 @@ func TestUARealmBrand(t *testing.T) {
 	c := New()
 
 	cn := &auth.Auth{UID: "u-c", AccessToken: "at"}
-	if got, want := c.userAgent(cn), "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+	if got, want := c.userAgent(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN UA=%q want %q", got, want)
 	}
-	if got, want := c.userAgent(globalAuth()), "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"; got != want {
+	if got, want := c.userAgent(globalAuth()), "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0"; got != want {
 		t.Errorf("global UA=%q want %q", got, want)
 	}
 	// 显式配置仍然赢（用户自定义品牌/版本）。
@@ -58,8 +59,8 @@ func TestUARealmBrand(t *testing.T) {
 //
 // 真机实测两版对同一 /v3/config 端点发的 UA 不同：
 //
-//	CN     → WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0  （三段，重复品牌）
-//	global → WorkBuddy/5.8.4 CLI/2.161.0                  （两段，单品牌）
+//	CN     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0  （三段，重复品牌）
+//	global → WorkBuddy/5.8.4 CLI/2.165.0                  （两段，单品牌）
 //
 // 旧实现发 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` / `CLI/2.63.2 CodeBuddy/2.63.2`：
 // 这两个串在 WorkBuddy 分发包里根本不存在（只有 WorkBuddy 形态），属最显眼的指纹。
@@ -67,14 +68,14 @@ func TestV3ProbeUAOfficial(t *testing.T) {
 	c := New()
 	cn := &auth.Auth{UID: "u-c", AccessToken: "at"}
 
-	if got, want := c.v3ProbeUA(cn), "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+	if got, want := c.v3ProbeUA(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN v3ProbeUA=%q want %q", got, want)
 	}
-	if got, want := c.v3ProbeUA(globalAuth()), "WorkBuddy/5.8.4 CLI/2.161.0"; got != want {
+	if got, want := c.v3ProbeUA(globalAuth()), "WorkBuddy/5.8.4 CLI/2.165.0"; got != want {
 		t.Errorf("global v3ProbeUA=%q want %q", got, want)
 	}
 	// 第二路（单品牌两段式）在 CN 下与主路不同，才有多目录覆盖的意义。
-	if got, want := c.v3ProbeUALite(cn), "WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+	if got, want := c.v3ProbeUALite(cn), "WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN v3ProbeUALite=%q want %q", got, want)
 	}
 	// 任何一路都不许再出现 CodeBuddy 字面量。
@@ -187,15 +188,27 @@ func TestIdentityHeadersEnterpriseWithTokenSource(t *testing.T) {
 	}
 }
 
-// TestChatCarriesPrivateData 真机 chat 出站恒带 X-Private-Data: true。
+// TestChatCarriesPrivateData 真机 chat 出站恒带 X-Private-Data: **false**。
+//
+// 5.9.3 真机 7 条 /v2/chat/completions 一律 `X-Private-Data: false`（含 main 与
+// auxiliary）。客户端语义是「开了模型优化 → 声明 false」，只有企业版/显式关优化才发 true。
 func TestChatCarriesPrivateData(t *testing.T) {
 	c := New()
 	c.ChatBaseCN = "https://cn.example"
 	a := &auth.Auth{UID: "u1", AccessToken: "at"}
 	req := httptest.NewRequest("POST", "https://cn.example/v2/chat/completions", nil)
 	c.ChatHeaders(req, a, "", ChatMeta{ConversationID: "c1", ConversationRequestID: "r1"})
-	if got := req.Header.Get("X-Private-Data"); got != "true" {
-		t.Fatalf("X-Private-Data=%q want true", got)
+	if got := req.Header.Get("X-Private-Data"); got != "false" {
+		t.Fatalf("X-Private-Data=%q want false", got)
+	}
+	// 同批真机头里必带 X-Agent-Runtime: local-agent。
+	if got := req.Header.Get("X-Agent-Runtime"); got != "local-agent" {
+		t.Fatalf("X-Agent-Runtime=%q want local-agent", got)
+	}
+	// baggage 必须与同请求的会话头同值（头体/头间一致性）。
+	if got := req.Header.Get("baggage"); !strings.Contains(got, "codebuddy.session_id=c1") ||
+		!strings.Contains(got, "codebuddy.conversation_request_id=r1") {
+		t.Fatalf("baggage=%q 需含 session/conversation_request 同值", got)
 	}
 }
 
@@ -227,7 +240,7 @@ func TestDesktopReportDomainIsHost(t *testing.T) {
 //
 // 2026-10-20 双版本真机抓包（同一台机器）：
 //
-//	CN     ideVersion 5.8.3 commit db0e9b51b7fa… releaseDate 1792029498676，**带** qimei36
+//	CN     ideVersion 5.9.3 commit d4692421… releaseDate 1793093056315，**带** qimei36
 //	global ideVersion 5.8.4 commit 73952edb48da… releaseDate 1792063084107，**无** qimei36
 //
 // 键数差集恰好只有 qimei36（CN 28 键 / GL 27 键）。此前不分档、恒用 GL 的三元组，
@@ -242,7 +255,7 @@ func TestDesktopReportFingerprintPerRealm(t *testing.T) {
 		qimei   bool
 	}{
 		{"CN", &auth.Auth{UID: "u-c", AccessToken: "at", Nickname: "cn"},
-			"5.8.3", "db0e9b51b7fa0b383f41f5b0b83dd442c8557918", 1792029498676, true},
+			"5.9.3", "d46924219e79332f49c37ccebf27292f87001b19", 1793093056315, true},
 		{"global", globalAuth(),
 			"5.8.4", "73952edb48da46bd0b244661efe22f4f247c4977", 1792063084107, false},
 	}
@@ -279,10 +292,10 @@ func TestDesktopReportFingerprintPerRealm(t *testing.T) {
 // TestDesktopUAPerRealm 桌面端 UA 的品牌段与客户端版本都跟着 realm 走。
 func TestDesktopUAPerRealm(t *testing.T) {
 	cn := &auth.Auth{UID: "u-c", AccessToken: "at"}
-	if got, want := desktopUAFor(cn), "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+	if got, want := desktopUAFor(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
-	if got, want := desktopUAFor(globalAuth()), "workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"; got != want {
+	if got, want := desktopUAFor(globalAuth()), "workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
 	}
 }

@@ -229,6 +229,41 @@ func TestParseSoftRateReset(t *testing.T) {
 	}
 }
 
+// TestParseQueueRetryAfter 6020 排队信封的重试口径在 body（data.retry_after，
+// 实测真机：429 + code 6020，data 含 queue_position/retry_after/estimated_wait，
+// 头侧无 Retry-After）。ParseRetryAfter 只认头，拿不到这个口径——
+// parseQueueRetryAfter 补上 body 侧，供末端 429 的 Retry-After 上报使用。
+func TestParseQueueRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want time.Duration
+		ok   bool
+	}{
+		{"6020 真机形态", `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`, 40 * time.Second, true},
+		{"retry_after=0（不该出现的边界）", `{"code":6020,"data":{"retry_after":0}}`, 0, false},
+		{"6021 无 data（queue.full 无等待口径）", `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea"}`, 0, false},
+		{"非 JSON", `upstream unavailable`, 0, false},
+		{"空 body", ``, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseQueueRetryAfter([]byte(c.body))
+			if ok != c.ok {
+				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
+			}
+			if ok && got != c.want {
+				t.Errorf("got=%v want %v", got, c.want)
+			}
+		})
+	}
+	// 上限封顶：异常大的 retry_after 按 retryAfterSanity 截断，不把天文数字带回
+	//（estimated_wait 是另一个字段不会误入；防上游口径漂移）。
+	if d, ok := parseQueueRetryAfter([]byte(`{"code":6020,"data":{"retry_after":999999}}`)); !ok || d != retryAfterSanity {
+		t.Errorf("cap: got=%v,%v want %v,true", d, ok, retryAfterSanity)
+	}
+}
+
 type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -617,11 +652,12 @@ func TestGlobalBaseByDomain(t *testing.T) {
 		{name: "global 非国际域回落默认", realm: "global", domain: "example.com",
 			wantChat: "https://www.codebuddy.ai", wantBilling: "https://www.codebuddy.ai", wantWeb: "https://www.codebuddy.ai"},
 		// 非 global 账号恒走 CN 三域（realm 决定域，domain 只在 global 内选主机）。
-		// CN 三个 base 本来就不同源：chat/web=workbuddy.cn、billing=codebuddy.cn。
+		// CN 三个 base 同源（2026-10-28 起）：客户端把 chat / billing / web 全打到
+		// www.workbuddy.cn（5.9.3 真机 23 条 checkin + 12 条 resource + 13 条 growth 全在此域）。
 		{name: "空 domain 非 global 走 CN", domain: "",
-			wantChat: "https://www.workbuddy.cn", wantBilling: "https://www.codebuddy.cn", wantWeb: "https://www.workbuddy.cn"},
+			wantChat: "https://www.workbuddy.cn", wantBilling: "https://www.workbuddy.cn", wantWeb: "https://www.workbuddy.cn"},
 		{name: "非国际域非 global 走 CN", domain: "example.com",
-			wantChat: "https://www.workbuddy.cn", wantBilling: "https://www.codebuddy.cn", wantWeb: "https://www.workbuddy.cn"},
+			wantChat: "https://www.workbuddy.cn", wantBilling: "https://www.workbuddy.cn", wantWeb: "https://www.workbuddy.cn"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

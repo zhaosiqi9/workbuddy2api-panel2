@@ -268,6 +268,19 @@ func (a *Auth) TokenSource() string {
 	return jwtClaim(a.AccessTokenValue(), "token_source")
 }
 
+// IdSource 从 AccessToken 的 JWT payload 里读 `id_source` 声明（官方客户端据此填
+// 出站 X-Id-Source 头与 X-Userinfo.id_source 段）。
+//
+// 与 TokenSource 的差别很重要：token_source 描述「这次授权走了哪条流程」（企业切换等，
+// 个人号也有），id_source 描述「身份来源」——两者在真机 runIdentityHeaders() 里是
+// 各自独立触发的条件维度。同样现解码不缓存：换发 token 后声明可能变。
+func (a *Auth) IdSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "id_source")
+}
+
 // jwtClaim 解出 JWT payload 里的指定字符串声明；非 JWT / 解码失败返回空。
 // 先按无填充 base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
 func jwtClaim(token, name string) string {

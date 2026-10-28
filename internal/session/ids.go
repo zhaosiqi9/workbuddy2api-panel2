@@ -81,6 +81,34 @@ func NewConversationID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
+// NewTimeOrderedID 生成客户端同形态的**时间有序 UUID**（UUIDv7，36 字符带横线）。
+//
+// 依据：5.9.3 真机 X-Conversation-ID / acp-connection-id 形如
+// `01a1815d-dacf-75f1-8919-7f596025b9b3` —— 前 48 bit 解出 1793171774159 ms，恰是该次
+// 操作的时刻，第 13 位恒为 `7`，正是 UUIDv7（48 bit unix_ms + ver 7 + rand）。旧实现给
+// 这两处发 32 hex 无横线串或 v4 UUID，位布局与客户端不同（v4 无时间位，跨请求不可排序）。
+//
+// 布局：48 bit 时间戳 | 4 bit 版本(7) | 12 bit rand_a | 2 bit variant(10) | 62 bit rand_b。
+func NewTimeOrderedID() string {
+	var b [16]byte
+	ms := uint64(time.Now().UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		// 熵源故障兜底：仍拼出合法 36 字符 v7 形态（后 10 字节取时间派生，不 panic）。
+		for i := 6; i < 16; i++ {
+			b[i] = byte(ms >> uint((i%6)*8))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x70 // version 7
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // NewTraceID 生成链路 trace ID：32 hex，**纯随机、不带时间位**。
 //
 // 与 NewMessageID 的区别是故意的：官方国际版 5.8.4 真机抓包里

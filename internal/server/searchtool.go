@@ -241,7 +241,8 @@ func (h *Handler) probeOnce(ctx context.Context, realm, model string, body []byt
 			break
 		}
 		tried[a.UID] = true
-		rc, _, _, err := h.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{}, nil)
+		// AgentType=auxiliary：web_search 工具的内部探测调用（非用户主对话）。
+		rc, _, _, err := h.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{AgentType: upstream.AgentTypeAuxiliary}, nil)
 		if err != nil {
 			lastErr = err
 			var ue *upstream.Error
