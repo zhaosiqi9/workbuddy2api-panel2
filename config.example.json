@@ -1,5 +1,5 @@
 {
-  "listen": ":7863",
+  "listen": "127.0.0.1:7863",
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
@@ -84,6 +84,14 @@
     "hidden": [],
     "allowed": []
   },
+  "thinking": {
+    "_comment": "网关思考档位策略。enabled=false 完全不碰档位；client_priority=true 客户端优先：客户端传了档位就照单全收（含关闭思考），只在缺档时补 default_effort；false 网关优先，按 override_scope 改写客户端档位（level=只改档位、尊重客户端关闭思考；all=连关闭也改写为开启）。default_effort=max 取模型支持的最高档，也可写 high/xhigh/medium/low/minimal（模型不支持时落到不高于它的最高支持档）。model_defaults 按模型覆盖目标档：\"cn:xxx\"/\"global:xxx\" 精确到域，裸名两域共用；\"inherit\" 表示不覆盖。面板「模型与档位」页每行的「网关档位」下拉直接写本表（域精确键），配置页仅保留总开关与优先级三选一；保存后热生效。",
+    "enabled": true,
+    "default_effort": "max",
+    "client_priority": true,
+    "override_scope": "level",
+    "model_defaults": {}
+  },
   "prompt": {
     "mode": "passthrough",
     "file": ""
@@ -129,5 +137,10 @@
     "webhook_url": "",
     "min_healthy_cn": 1,
     "min_healthy_global": 0
+  },
+  "watchdog": {
+    "_comment": "上游目录改版监控：定期对 /v1/models 结果取指纹，模型新增/下线或能力字段变动时经 alerting.webhook_url 通知。默认关闭——只在想第一时间知道上游改了目录时开。",
+    "enabled": false,
+    "interval_seconds": 3600
   }
 }

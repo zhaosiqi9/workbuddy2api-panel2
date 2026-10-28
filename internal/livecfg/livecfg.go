@@ -35,6 +35,14 @@ type Snapshot struct {
 	// 的等价模型（裸名 → 裸名）。nil = 不降级。与 aliases 的区别：aliases 是
 	// 「客户端名→真实名」的静态映射，本表是「限流时的临时改道」，且不写持久状态。
 	ModelFallback map[string]string
+	// Thinking* 网关卡点思考档位策略（config thinking 节）的只读镜像。出站改写由
+	// upstream.Client 自己持有 EffortPolicy；这里只给面板「网关档位」列算**当前生效值**，
+	// 让模型列表与真实注入口径一致（含按模型覆盖 model_defaults 的域精确键）。
+	ThinkingEnabled        bool
+	ThinkingDefaultEffort  string
+	ThinkingClientPriority bool
+	ThinkingOverrideScope  string
+	ThinkingModelDefaults  map[string]string
 }
 
 // NormalizeModelAliases 把用户配置的 aliases 条目（"客户端名=真实模型名"）归一化为查找表。

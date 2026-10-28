@@ -1346,6 +1346,10 @@ func TestConfigFormMatchesCFGMap(t *testing.T) {
 	}
 
 	// 1) 表单里的每个 name 都要有 CFG_MAP 条目（否则收集/回填都拿不到它）。
+	// 例外：复合控件不是 1:1 配置键，由 collectConfig 显式拆成多个既有键提交——
+	// thinking_mode（三选一单选组）→ thinking.client_priority + thinking.override_scope，
+	// 配置格式保持不变（手改配置文件仍是这两个字段）。
+	composite := map[string]bool{"thinking_mode": true}
 	f := html[strings.Index(html, `<form id="cfgForm">`):]
 	f = f[:strings.Index(f, "</form>")]
 	names := map[string]bool{}
@@ -1356,6 +1360,9 @@ func TestConfigFormMatchesCFGMap(t *testing.T) {
 		t.Fatal("未从配置表单解析出任何 name 字段")
 	}
 	for n := range names {
+		if composite[n] {
+			continue
+		}
 		if !inMap(n) {
 			t.Errorf("表单字段 %q 在 CFG_MAP 里没有条目（保存时会被静默丢弃）", n)
 		}

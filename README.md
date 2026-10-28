@@ -70,7 +70,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
 | ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点）+ **成长任务队列**（11 点，自动跑一遍任务中心待办），各类独立开关 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
-| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动对齐到模型支持的**最近档**（同距优先模型默认档，行里显示生效档位） |
+| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动对齐到模型支持的**最近档**（同距优先模型默认档，行里显示生效档位）；网关侧 `thinking.*` 档位策略（客户端优先 / 网关优先 + 作用域「只档位 / 档位与开关」，含按模型覆盖、`off` 尊重与保存后热生效） |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
@@ -144,7 +144,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
-| **模型繁忙度（面板）** | 「模型与档位」列出官方 `/v2/chat/busy` 的实时繁忙度（idle/normal/busy/congested/unavailable），只在 `繁忙 / 拥堵 / 不可用` 时挂色标——它解释了 chat 侧偶发的 429 / 6021 queue.full。**只读观测**：不参与选号；服务端偶发对整批回 `unknown`（实测同批重查可在 idle/unknown 间跳），故取不到就不标 |
+| **模型繁忙度（面板）** | 「模型与档位」列出官方 `/v2/chat/busy` 的实时繁忙度（idle/normal/busy/congested/unavailable），只在 `繁忙 / 拥堵 / 不可用` 时挂色标——它解释了 chat 侧偶发的 429 / 6021 queue.full。**只读观测**：不参与选号；服务端偶发对整批回 `unknown`（实测同批重查可在 idle/unknown 间跳），故取不到就不标；同页每行另有**网关档位**下拉（首项＝模型支持的最高档，其余为具体档与 `off`；写入 `thinking.model_defaults` 精确键、保存即热生效，策略关闭时整体禁用并显示生效档）与**下游可见**开关（与 `models.hidden` 同一份黑名单：关掉的模型从 `/v1/models` 隐藏、点名调用被拒，行尾置灰并排到列表末尾） |
 | **联网检索（官方 agenttool）** | `POST /v1/search` 透传官方 `{base}/agenttool/v1/search`（`{query,max_results}` → `{results[].title/url/snippet/date,total_results}`，查询免费；对 DSH（DeepSeek Harness，按 UA 含 `deepseek-harness` 识别）额外启用 DeepSeek Search API 兼容：接受 `count` 作为条数，`date` 缺失时补 `null`、`title`/`snippet` 缺失时补空串；其余客户端保持上游原文逐字节透传）；同一 base 还提供 `POST /v1/fetch`（`{"url":"https://…"}` → `{"content":"<markdown>"}`，透传官方 `agenttool/v1/webfetch`）；加 `"deep":true` 则改走官方**综述式**检索 `agentic_search`（服务端多轮检索 + 抓页 + 带引用综述，回 `done` 帧原文：`synthesis.content` + `results` 整页正文 + `statuses` + `partial` 降级标记）——实测单次 18~66s、prompt ~48K tokens，故默认走 snippet 快路径（~1s）。另在 `/v1/messages` 与 `/v1/responses` 上落地服务端联网工具：客户端（Claude Code / Codex）只声明 `{"type":"web_search_20250305","name":"web_search"}`（或 Responses 的托管 `{"type":"web_search"}`），网关侧先让模型自己写检索词（探测）、执行检索、把结果注入上下文，再走既有流式管道出答案。Anthropic 侧按协议回报 `server_tool_use` + `web_search_tool_result` 块（含来源 URL，且**不**降级成客户端可执行的 `tool_use`）；没声明该工具的请求零额外开销；检索失败如实告知模型（不静默当成「网上没有」），联网不可用则降级为普通对话 |
 | **成长任务队列每日排程** | `schedule.growth_hours`（默认 `[11]`）+ `schedule.growth_enabled`：面板任务中心的执行队列按排程每日自动跑一遍（扫描待办 → accept → 动作 → 达标领奖），与手动入口共用同一队列与账号锁；`POST /admin/tasks/growth/run` 可手动补跑 |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
@@ -154,8 +154,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **余额趋势视图** | `internal/balance` 每 30 分钟在余额刷新之后顺手记一个水位（不额外打上游，按账号节流），落盘 `data/balance_history.json`（近 30 天原始点 + 365 天日粒度，点数超 20 万自动折叠）。面板「余额趋势」：多账号水位折线（cn/global 分域，两域积分不同源、不做跨域总计）、每日变化柱状图（不完整日淡化）、按账号明细（当前 / 最低 / 最高 / 净变化 / 今日消耗 / 今日到账 / 本月消耗 / 本月到账 / 采样点数）。**消耗与到账是下界估计**：按相邻采样差值分正负累加，30 分钟间隔远粗于真实事件密度（实测 6 小时 2127 次请求 vs 14 个采样点），同一窗口内的消耗与到账会被合并成净差，UI 显式标注、不做成精确值的样子。折叠点随点保存当日首值 / 消耗 / 到账，否则历史日这三项会静默归零（不报错、无空值，只是给出错的 0） |
 | **补领清扫** | `schedule.task_sweep_enabled`（默认开）/ `task_sweep_minutes`（默认 15）：周期 accept 待接受的、claim 已达标未领的（不跑行为链路），兜住新号自动跑当时未达标与 `autoActions` 白名单外的任务 |
 | **保留积分** | `pool.reserve_credits`（缺省 10）设最低余额：余额**已知**且低于该值的账号停止接单，面板账号行显示「保留积分」标记，避免余额被用到 0 触发上游提醒短信；仍留在池中照常签到/猫猫旅行，充值后自动恢复。`0` = 关闭 |
-| **用量页积分历史** | 用量视图新增「积分与 token 按小时」表：每小时列出请求数 / prompt / completion / 合计 token / **扣费积分** / 兑换率（1 积分换多少 token，倒序，最近一小时在最上面），卡片另给窗口内积分合计与兑换率。积分取上游末帧 `usage.credit`，**未观测到的请求不计**（「没测到」≠「没花钱」）；随小时桶一起折叠进日桶，保留 90 天 |
-| **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
+| **用量页积分历史** | 用量视图新增「积分与 token 按小时」表：每小时列出请求数 / prompt / completion / 合计 token / **扣费积分** / 兑换率（1 积分换多少 token，倒序，最近一小时在最上面），卡片另给窗口内积分合计与兑换率。积分取上游末帧 `usage.credit`，**未观测到的请求不计**（「没测到」≠「没花钱」）；随小时桶一起折叠进日桶，保留 90 天；另给窗口内**总积分**卡片（`usage.credit` 求和，无样本时显示 —） |
+| **模型能力透出** | `/v1/models` 附带 `context_length` / `max_output_tokens` / 工具·视觉·思考能力标记 / 积分倍率等上游真实字段，并声明 `reasoning_supported_efforts` / `reasoning_default_effort`：默认档按 `thinking.*` 策略写成网关**实际生效档**（策略关闭时忠于上游），`can_disable_thinking` 的模型在档位表里追加 `off`，目录只给固定档的模型声明为单档 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖，见下文） |

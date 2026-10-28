@@ -7,6 +7,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"math"
 	"strings"
 )
 
@@ -66,7 +67,17 @@ func normalizeModelName(obj map[string]any) {
 // 导出入口不注入 prompt_cache_key（保持既有公开语义）；生产路径由
 // client.prepareBody 调用 prepareBodyOpt 并传入 cache 参数。
 func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64) ([]byte, string) {
-	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, "", "", false)
+	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, "", nil, "", "", false)
+	return body, eff
+}
+
+// PrepareBodyOptWithEffortPolicy 在 …Caps 之上接入网关思考档位策略（config
+// thinking 节）：客户端缺档补网关默认档；client_priority=false 时按网关档位
+// 改写客户端显式档（override_scope 控制是否连「关闭思考」一起改写）。
+// realm 用于 thinking.model_defaults 的 "realm:model" 精确匹配；policy 为 nil
+// 或未启用时与 …Caps 完全一致。
+func PrepareBodyOptWithEffortPolicy(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy) ([]byte, string) {
+	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, realm, policy, "", "", false)
 	return body, eff
 }
 
@@ -77,7 +88,7 @@ func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts 
 //   - requested 在 injectThinking 之前抓取，因此不含网关补的默认档——它回答
 //     「客户端到底发没发、发的哪一档」（issue #43/#18 的判别依据）；
 //   - effective 是降级后的出站档位，未携带/未知模型/未知档位 → ""。
-func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, cacheUID, cacheConversation string, injectCache bool) ([]byte, string, string) {
+func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy, cacheUID, cacheConversation string, injectCache bool) ([]byte, string, string) {
 	if len(src) == 0 {
 		return src, "", ""
 	}
@@ -127,16 +138,28 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 		obj["messages"] = msgs
 	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
-	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
-	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	// requested 必须在 injectThinking 之前抓：它要回答的是「客户端发了什么」，
 	// 而 injectThinking 会给缺档的请求补默认档——补完之后两者就再也分不开了
 	// （issue #43：客户端设 max、日志显示 high，读者无法判断是「没收到 max」
 	// 还是「收到了但降级」，这一列必须能自证）。
 	requested := requestedEffort(obj)
 	modelName, _ := obj["model"].(string)
+	// 网关思考档位策略（见 effort_policy.go）同样先于 injectThinking：
+	// override_scope=all 要把客户端的 off/disabled 改写成「开启 + 目标档」，
+	// 晚一步就会被 injectThinking 写成 thinking.type=disabled 并删掉档位。
+	// client_priority=true 时这里只在「客户端没发档位」时补默认档。
+	policyEffort := applyEffortPolicy(obj, modelName, efforts[modelName], policy, realm)
+	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
+	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
+	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
 	effort := normalizeReasoningEffort(obj, efforts, defaultEfforts)
+	if policyEffort != "" {
+		// 网关写入的目标档已是「解析到支持列表」的结果；降级管线不会再改它，
+		// 但 effective 以实际写入值为准（off/disabled 被改写的场景 normalize
+		// 也可能返回空）。
+		effort = policyEffort
+	}
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
@@ -601,16 +624,17 @@ func normalizeToolPatterns(obj map[string]any) {
 		}
 		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
 		if fn, ok := tool["function"].(map[string]any); ok {
-			unescapePatternLiteralEscapes(fn["parameters"])
+			normalizeSchemaTree(fn["parameters"])
 		}
-		unescapePatternLiteralEscapes(tool["parameters"])
+		normalizeSchemaTree(tool["parameters"])
 	}
 }
 
-// unescapePatternLiteralEscapes 递归改写 schema 树里 pattern 值与 patternProperties
-// 键中的 `\_` → `_`（patternProperties 的键也是正则；map 键不可原地改，命中时重建
-// 该层）。
-func unescapePatternLiteralEscapes(node any) {
+// normalizeSchemaTree 递归归一化工具参数 schema 树：
+//   - pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是正则；
+//     map 键不可原地改，命中时重建该层）；
+//   - 只有 enum、没有 type 的属性补上可无损推断的类型（见 inferEnumType）。
+func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
 		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
@@ -630,12 +654,55 @@ func unescapePatternLiteralEscapes(node any) {
 				n["patternProperties"] = fixed
 			}
 		}
+		// enum 缺 type：Kimi 系对参数 schema 严格校验，直接 400 11133「Invalid request
+		// parameters」——同一个模型对带这类 schema 的客户端等于全废。类型能无损推断就补上，
+		// 推断不出来（混合标量/含 null）保持原样，让上游按原语义报错，不猜。
+		if _, hasType := n["type"]; !hasType {
+			if e, ok := n["enum"].([]any); ok && len(e) > 0 {
+				if t := inferEnumType(e); t != "" {
+					n["type"] = t
+				}
+			}
+		}
 		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+			normalizeSchemaTree(v)
 		}
 	case []any:
 		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+			normalizeSchemaTree(v)
 		}
 	}
+}
+
+// inferEnumType 从 enum 取值推断 JSON Schema 类型；推不出唯一类型时返回空（不改写）。
+// 数字经 encoding/json 解出来一律是 float64，故按「全为整数值」区分 integer / number。
+func inferEnumType(values []any) string {
+	var strs, nums, ints, bools int
+	for _, v := range values {
+		switch x := v.(type) {
+		case string:
+			strs++
+		case bool:
+			bools++
+		case float64:
+			nums++
+			if x == math.Trunc(x) {
+				ints++
+			}
+		default:
+			return "" // null / 对象 / 数组：类型不唯一，不猜
+		}
+	}
+	n := len(values)
+	switch {
+	case strs == n:
+		return "string"
+	case bools == n:
+		return "boolean"
+	case nums == n && ints == n:
+		return "integer"
+	case nums == n:
+		return "number"
+	}
+	return ""
 }

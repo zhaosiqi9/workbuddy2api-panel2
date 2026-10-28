@@ -45,8 +45,8 @@ var appVersion = "dev"
 var appRepository = "misakano7545/workbuddy2api-panel"
 
 // insecureKeyWarning 空 api_key = 完全不鉴权（httpauth.VerifyBearer 对空 key 恒放
-// 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（缺省 ":7863" 绑
-// 所有网卡）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
+// 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（显式配成
+// "0.0.0.0:7863" 或 ":7863"）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
 // 打印，安全状态返回空串。首启自动生成的随机 key 不会命中——这是给「照抄样例 /
 // 显式清空」的最后提醒，不阻塞启动。
 func insecureKeyWarning(listen, apiKey string) string {
@@ -209,6 +209,20 @@ func main() {
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
+	// 思考档位策略（thinking 节）：启动装载，面板保存配置时经 saveConfig 热更新。
+	up.SetEffortPolicy(effortPolicyOf(cfg))
+	if cfg.Thinking.Enabled {
+		priority := "客户端优先（只在缺档时补默认档）"
+		if !cfg.Thinking.ClientPriority {
+			priority = "网关优先（改写客户端档位）"
+			if cfg.Thinking.OverrideScope == "all" {
+				priority = "网关优先（档位与关闭意图一起覆盖）"
+			}
+		}
+		log.Printf("思考档位策略：默认档 %s；%s", cfg.Thinking.DefaultEffort, priority)
+	} else {
+		log.Printf("思考档位策略已关闭（不补档、不改写客户端档位）")
+	}
 	if cfg.Features.SanitizeBlacklistFingerprints {
 		if cfg.Features.SanitizeBrandScope == "identity" {
 			log.Printf("指纹脱敏已启用；品牌词规则仅作用于 system/developer（features.sanitize_brand_scope=identity）")
@@ -362,6 +376,12 @@ func main() {
 		ModelAliases:     livecfg.NormalizeModelAliases(cfg.Models.Aliases),
 		// 模型降级路由表（pool.model_fallback）：6004 限流时同账号改用等价模型。
 		ModelFallback: cfg.Pool.ModelFallback,
+		// 思考档位策略镜像：面板「模型与档位」页的「网关档位」列据此显示当前生效值。
+		ThinkingEnabled:        cfg.Thinking.Enabled,
+		ThinkingDefaultEffort:  cfg.Thinking.DefaultEffort,
+		ThinkingClientPriority: cfg.Thinking.ClientPriority,
+		ThinkingOverrideScope:  cfg.Thinking.OverrideScope,
+		ThinkingModelDefaults:  cfg.Thinking.ModelDefaults,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -546,6 +566,15 @@ func main() {
 		// 排程轮次结果汇总的推送出口（告警 webhook 同一条管道；未启用则只落面板日志）。
 		pn.SetNotifier(mon.Notify)
 		log.Printf("alerting: webhook on, every %ds", cfg.Alerting.IntervalSeconds)
+		// 上游目录改版监控也走这条管道（未启用告警时只写日志，见下方 watchdog 段）。
+		if cfg.Watchdog.Enabled {
+			go gw.WatchCatalog(ctx, time.Duration(cfg.Watchdog.IntervalSeconds)*time.Second, mon.Notify)
+			log.Printf("watchdog: 上游目录监控开，每 %ds", cfg.Watchdog.IntervalSeconds)
+		}
+	} else if cfg.Watchdog.Enabled {
+		// 没有 webhook 也要能开：变化只写日志（面板任务日志里能翻到）。
+		go gw.WatchCatalog(ctx, time.Duration(cfg.Watchdog.IntervalSeconds)*time.Second, nil)
+		log.Printf("watchdog: 上游目录监控开（未配置 alerting，仅写日志），每 %ds", cfg.Watchdog.IntervalSeconds)
 	}
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
@@ -717,6 +746,21 @@ func writeConfigInPlace(path string, out []byte) error {
 	return werr
 }
 
+// effortPolicyOf 把 config thinking 节转成 upstream 运行时策略。nil 配置/
+// 未启用时返回的策略由 Client.SetEffortPolicy 统一处理（Enabled=false 即不生效）。
+func effortPolicyOf(cfg *Config) *upstream.EffortPolicy {
+	if cfg == nil {
+		return nil
+	}
+	return &upstream.EffortPolicy{
+		Enabled:        cfg.Thinking.Enabled,
+		DefaultEffort:  cfg.Thinking.DefaultEffort,
+		ClientPriority: cfg.Thinking.ClientPriority,
+		OverrideScope:  cfg.Thinking.OverrideScope,
+		ModelDefaults:  cfg.Thinking.ModelDefaults,
+	}
+}
+
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, gw *server.Handler, pn *panel.Panel, running ...*Config) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
@@ -798,9 +842,17 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		AllowedModels:    newAllowedModels,
 		AllowlistEnabled: newAllowlistEnabled,
 		ModelAliases:     livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
+		// 思考档位策略镜像：与 up.SetEffortPolicy 同批热更新，面板立即回显新生效值。
+		ThinkingEnabled:        newCfg.Thinking.Enabled,
+		ThinkingDefaultEffort:  newCfg.Thinking.DefaultEffort,
+		ThinkingClientPriority: newCfg.Thinking.ClientPriority,
+		ThinkingOverrideScope:  newCfg.Thinking.OverrideScope,
+		ThinkingModelDefaults:  newCfg.Thinking.ModelDefaults,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)
+	// 思考档位策略热生效：改默认档 / 切换客户端优先或作用域后，下一次 chat 即按新策略。
+	up.SetEffortPolicy(effortPolicyOf(newCfg))
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

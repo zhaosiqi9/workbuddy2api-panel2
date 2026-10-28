@@ -571,11 +571,19 @@ func (h *Handler) modelList() []map[string]any {
 		entry = applyModelInfoFields(entry, mi)
 		// effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 		// （客户端可发现档位，不再盲传）。无档位 → 省略字段。
-		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+		// 固定档模型（上游只报 default_effort、没有 supportedEfforts，如
+		// mimo-v2.6-pro）：把该默认档当唯一支持档声明出去，客户端看到「只有这一档」
+		// 而不是空列表——面板侧同一口径（单档下拉）。
+		efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort)
+		if efforts == nil && mi.SupportsReasoning && mi.DefaultEffort != "" {
+			efforts, def = []string{mi.DefaultEffort}, mi.DefaultEffort
+		}
+		if efforts != nil {
 			entry["reasoning_supported_efforts"] = efforts
 			if def != "" {
 				entry["reasoning_default_effort"] = def
 			}
+			h.declareReasoning(entry, "cn", mi.ID, efforts)
 		}
 		out = append(out, entry)
 	}
@@ -609,7 +617,10 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			// context_length / max_output_tokens 四级查找（与 CN 动态分支同口径）。
 			var remoteCtx, remoteOut int64
+			var info upstream.ModelInfo
+			hasInfo := false
 			if mi, ok := globalInfos[id]; ok {
+				info, hasInfo = mi, true
 				entry = applyModelInfoFields(entry, mi)
 				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
 			}
@@ -617,11 +628,18 @@ func (h *Handler) modelList() []map[string]any {
 			if mo, ok := upstream.MaxOutputTokensListingV4(id, remoteOut, h.cfg.Upstream.HTTP); ok {
 				entry["max_output_tokens"] = mo
 			}
-			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
+			// 固定档模型与 CN 分支同口径：只报默认档、没有档位表时，把该默认档
+			// 当唯一支持档声明（否则 global 列表上这类模型看起来「没有思考能力」）。
+			efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id])
+			if efforts == nil && hasInfo && info.SupportsReasoning && info.DefaultEffort != "" {
+				efforts, def = []string{info.DefaultEffort}, info.DefaultEffort
+			}
+			if efforts != nil {
 				entry["reasoning_supported_efforts"] = efforts
 				if def != "" {
 					entry["reasoning_default_effort"] = def
 				}
+				h.declareReasoning(entry, "global", id, efforts)
 			}
 			out = append(out, entry)
 		}
@@ -1057,13 +1075,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
+	// splitApplied / movedApplied 11-128 的两层「不改文本」抢救各用一次（拆句留在 system、
+	// 搬家进 user），与 degradedApplied（中性提示词替换）按顺序各用一次，避免同请求反复重试。
+	splitApplied := false
+	movedApplied := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
 		body = prompt.Append(body, h.cfg.PromptText)
 	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
-		body = prompt.Rewrite(body, prompt.Degraded)
-		degradedApplied = true
+		// 降级期：与下面重试阶梯同一优先级——拆句留在 system 最好，其次搬家，都不行才整体替换。
+		if split, ok := prompt.SplitSystemMessages(body); ok {
+			body = split
+			splitApplied = true
+		} else if moved, ok := prompt.MoveSystemToUser(body, prompt.Degraded); ok {
+			body = moved
+			movedApplied = true
+		} else {
+			body = prompt.Rewrite(body, prompt.Degraded)
+			degradedApplied = true
+		}
 	}
 	// 渠道校验兜底：上游要求 messages[0] 必须是 system（首条 user 直接 400
 	// 11-128「first message is not system prompt」，首条 developer 报
@@ -1292,11 +1323,38 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
-			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
-			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
-			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
+			// 内容拦截误报（passthrough/append 模式）：三层抢救，从「改动最小」到「改动最大」。
+			// 每一层都只在本来就会失败的请求上多花一次上游调用，正常流量零影响。
+			//   ① SplitSystemMessages：按句界把 system 拆成多条，**仍在 system 里**，
+			//      文本一字不改（实测原段 400 / 拆开后 200，见 prompt 包注释）；
+			//   ② MoveSystemToUser：拆不动（单句 system）时把原文搬进首条 user；
+			//   ③ Rewrite(Degraded)：中性提示词整体替换，保证不再命中。
+			// 都被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !splitApplied {
+				if split, ok := prompt.SplitSystemMessages(body); ok {
+					body = split
+					splitApplied = true
+					// 置降级态：这条客户端的 system 每次都会被拦，逐请求重试等于双倍上游调用。
+					// 之后的新请求直接按拆分形态出站，文本不丢也不再撞墙。
+					h.degrade.Trigger()
+					delete(tried, acct.UID)
+					releaseHeld()
+					log.Printf("content-blocked (system fingerprint) -> split system into sentences, retry")
+					continue
+				}
+			}
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !movedApplied {
+				if moved, ok := prompt.MoveSystemToUser(body, prompt.Degraded); ok {
+					body = moved
+					movedApplied = true
+					h.degrade.Trigger()
+					delete(tried, acct.UID) // 单账号池也能拿到重试机会（重试占一次名额）
+					releaseHeld()
+					log.Printf("content-blocked (system fingerprint) -> moved system text into first user message, retry")
+					continue
+				}
+			}
 			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)

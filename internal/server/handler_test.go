@@ -1387,7 +1387,11 @@ func TestModelsDynamic(t *testing.T) {
 	// 断言字段映射：maxInputTokens → context_length，maxOutputTokens → max_output_tokens
 	for _, m := range data {
 		mm := m.(map[string]any)
-		switch mm["id"] {
+		// 条目的 id 带 "cn:" 前缀（网关路由协议），比较前去掉，否则下面所有
+		// 分支都不会命中——曾经就是这样「测了但没断言」。
+		id, _ := mm["id"].(string)
+		id = strings.TrimPrefix(id, "cn:")
+		switch id {
 		case "dyn-model-a":
 			if mm["context_length"].(float64) != 65536 {
 				t.Errorf("dyn-model-a context_length=%v want 65536", mm["context_length"])
@@ -1395,21 +1399,25 @@ func TestModelsDynamic(t *testing.T) {
 			if mm["max_output_tokens"].(float64) != 8192 {
 				t.Errorf("dyn-model-a max_output_tokens=%v want 8192", mm["max_output_tokens"])
 			}
-			// reasoning 档位透出：supported_efforts + default_effort
-			efforts, _ := mm["supported_efforts"].([]any)
+			// reasoning 档位透出：reasoning_supported_efforts + reasoning_default_effort
+			efforts, _ := mm["reasoning_supported_efforts"].([]any)
 			if len(efforts) != 3 || efforts[0] != "low" {
-				t.Errorf("dyn-model-a supported_efforts=%v", mm["supported_efforts"])
+				t.Errorf("dyn-model-a reasoning_supported_efforts=%v", mm["reasoning_supported_efforts"])
 			}
-			if mm["default_effort"] != "medium" {
-				t.Errorf("dyn-model-a default_effort=%v want medium", mm["default_effort"])
+			if mm["reasoning_default_effort"] != "medium" {
+				t.Errorf("dyn-model-a reasoning_default_effort=%v want medium", mm["reasoning_default_effort"])
+			}
+			// 不声明网关专有字段，也不在策略未启用时改写上游默认档。
+			if _, has := mm["reasoning_gateway_effort"]; has {
+				t.Errorf("不得透出网关专有字段 reasoning_gateway_effort")
 			}
 		case "dyn-model-b":
 			// 上游未返回 reasoning → 两个档位字段都省略（客户端按自身默认）
-			if _, has := mm["supported_efforts"]; has {
-				t.Errorf("dyn-model-b supported_efforts should be omitted, got %v", mm["supported_efforts"])
+			if _, has := mm["reasoning_supported_efforts"]; has {
+				t.Errorf("dyn-model-b reasoning_supported_efforts should be omitted, got %v", mm["reasoning_supported_efforts"])
 			}
-			if _, has := mm["default_effort"]; has {
-				t.Errorf("dyn-model-b default_effort should be omitted")
+			if _, has := mm["reasoning_default_effort"]; has {
+				t.Errorf("dyn-model-b reasoning_default_effort should be omitted")
 			}
 		case "glm-9.9":
 			if mm["context_length"].(float64) != 262144 {
@@ -1427,6 +1435,28 @@ func TestModelsDynamic(t *testing.T) {
 	dynamicModelsCache.RUnlock()
 	if cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
+	}
+
+	// 配置网关策略后：默认档声明改成网关实际会补的档（max → 最高支持档），
+	// 客户端照这个值预填不会把网关补档抵消掉。
+	up.SetEffortPolicy(&upstream.EffortPolicy{Enabled: true, DefaultEffort: "max"})
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.Unlock()
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	for _, m := range resp["data"].([]any) {
+		mm := m.(map[string]any)
+		if mm["id"] != "cn:dyn-model-a" {
+			continue
+		}
+		if got := mm["reasoning_default_effort"]; got != "high" {
+			t.Errorf("reasoning_default_effort=%v want high（max → 最高支持档）", got)
+		}
+		if _, has := mm["reasoning_gateway_effort"]; has {
+			t.Errorf("不得透出网关专有字段 reasoning_gateway_effort")
+		}
 	}
 }
 
@@ -1828,8 +1858,66 @@ func TestStatusRequiresAuth(t *testing.T) {
 	}
 }
 
-// TestContentBlockedTriggersDegradedRetry passthrough 模式下首请求 400（11128 文案）
-// → 降级重试（Degraded）→ 200，客户端无感。验证第二次出站 body 为 Degraded。
+// TestContentBlockedSplitSystemFirst 11-128 的首选抢救是「拆句留在 system」：
+// 多句 system 被拆成多条 system 消息重试，**不搬到 user**（承载通道不变）。
+// 单句 system 拆不动时才走搬家（见 TestContentBlockedTriggersDegradedRetry）。
+func TestContentBlockedSplitSystemFirst(t *testing.T) {
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			if len(bodies) == 1 {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":11-128,"msg":"blocked by security policy"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	const sys = "Fingerprint sentence one here. Fingerprint sentence two here."
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"`+sys+`"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls, got %d", len(bodies))
+	}
+	var second map[string]any
+	if err := json.Unmarshal(bodies[1], &second); err != nil {
+		t.Fatalf("second body json: %v", err)
+	}
+	msgs := second["messages"].([]any)
+	// 拆成两条 system + 原 user；全文仍在 system 里，user 未被塞入 system 原文。
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 条消息（2 system + 1 user），got %d: %v", len(msgs), msgs)
+	}
+	for i := 0; i < 2; i++ {
+		if role := msgs[i].(map[string]any)["role"]; role != "system" {
+			t.Errorf("第 %d 条应为 system: %v", i, role)
+		}
+	}
+	if got := msgs[2].(map[string]any)["content"]; got != "hi" {
+		t.Errorf("user 被动了: %v", got)
+	}
+}
+
+// TestContentBlockedTriggersDegradedRetry 单句 system 拆不动 → 走搬家：
+// passthrough 模式下首请求 400（11-128 文案）→ 重试 → 200，客户端无感。
+// 断言第二次出站的 system 是 Degraded 中性句、system 原文进了首条 user。
 func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	// 记录每次出站请求体，断言第二次为 Degraded 文本。
 	var bodies [][]byte
@@ -1866,12 +1954,20 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	if len(bodies) != 2 {
 		t.Fatalf("want 2 upstream calls (first 400 + retry), got %d", len(bodies))
 	}
-	// 第二次出站 body 的 messages 头部 system 内容应为 Degraded 文本。
+	// 第二次出站：system 换成 Degraded 中性句，**原文搬进首条 user**（不再丢弃人格）。
 	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
 		t.Errorf("second body should contain Degraded prompt: %s", bodies[1])
 	}
-	if strings.Contains(string(bodies[1]), "原始指纹") {
-		t.Errorf("second body should not contain original system: %s", bodies[1])
+	var second map[string]any
+	if err := json.Unmarshal(bodies[1], &second); err != nil {
+		t.Fatalf("second body json: %v", err)
+	}
+	msgs := second["messages"].([]any)
+	if got := msgs[0].(map[string]any)["content"]; got != prompt.Degraded {
+		t.Errorf("首条 system 应为 Degraded: %v", got)
+	}
+	if got, _ := msgs[1].(map[string]any)["content"].(string); !strings.Contains(got, "原始指纹") {
+		t.Errorf("system 原文应搬进首条 user 而不是丢掉: %v", msgs[1])
 	}
 }
 
