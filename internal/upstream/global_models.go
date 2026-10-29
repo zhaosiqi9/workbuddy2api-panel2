@@ -23,31 +23,43 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 )
 
-// GlobalModelNames 国际版（global realm）历史静态名单（PLAN §7.2 附录 21 名）。
+// GlobalModelNames 国际版（global realm）历史静态名单（2026-10-29 WorkBuddy AI 5.9.3
+// 真机 /v3/config 实测 25 条，与 GlobalCatalogSource=v3-desktop 的目录逐条对齐）。
+//
 // 纯动态化后**不再作为模型目录的基底/兜底**：/v1/models 只透出上游实际下发的模型。
-// 保留仅作历史对照（global e2e 观测日志差集参照）。
+// 保留仅作历史对照（global e2e 观测日志差集参照）与「目录是否整体换了代」的肉眼基准。
+//
+// 上一版是 5.8.4 时期的 21 条，含 gpt-5.5 / gpt-5.4 / gpt-5.3-codex / gemini-3.5-flash /
+// glm-5.2 / kimi-k2.6 / hy4-preview-f 等已下架 id，且缺 gpt-6 系与 glm-5.3-flash、
+// kimi-k3.1-pro、grok-4.7、gemini-3.8-flash、minimax-m3.1-flash 等 5.9.3 新增——拿它做
+// 差集参照会得出一半假差异，故按实测刷新。
 var GlobalModelNames = []string{
 	"default-model",
 	"fast-model",
 	"balanced-model",
 	"primary-model",
+	"deepseek-v4.1-flash",
+	"deepseek-v4.1-flash-sg",
+	"glm-5.3",
+	"glm-5.3-flash",
 	"hy4-preview",
+	"hy3",
+	"kimi-k3",
+	"kimi-k3.1-pro",
+	"kimi-k3.1-pro-highspeed",
+	"minimax-m3.1-flash",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
-	"deep-model",
-	"deepseek-v4.1-flash",
-	"gpt-6-astra",
-	"hy4-preview-f",
-	"hy3",
-	"glm-5.2",
 	"gpt-5.6-luna",
-	"gpt-5.5",
-	"gpt-5.4",
-	"gpt-5.3-codex",
-	"gemini-3.5-flash",
-	"glm-5.3",
-	"kimi-k3",
-	"kimi-k2.6",
+	"gpt-6-astra",
+	"gpt-6-sol",
+	"gpt-6-luna",
+	"gpt-6.1-sol",
+	"gemini-3.8-flash",
+	"grok-4.7",
+	// 媒体生成（tags 决定进 GenerationModels 而不是对话列表）
+	"hy-image-3.5",
+	"kling-video-v3",
 }
 
 // fetchGlobalModelsCache 探测结果缓存（语义参照 CN 侧 handler.dynamicModelsCache：1h TTL +
@@ -237,15 +249,33 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		ch := make(chan probeResult, 1)
 		go func() {
 			// chatBase 已按 realm 切 global base。
-			byID, perr := c.fetchV3ConfigModelMap(a, ua)
+			byID, pick, perr := c.fetchV3ConfigModelMap(a, ua)
 			if perr != nil {
 				ch <- probeResult{err: perr}
 				return
 			}
+			// 出图模型旁路留存（/v1/models 以 image_generation 标记列出），照旧不进对话列表。
+			// 必须在可见性过滤前做：媒体模型不在 agent 菜单里。
+			c.stashGenerationModels("global", sortedInfos(byID))
 			ids := make([]string, 0, len(byID))
 			outInfos := make([]ModelInfo, 0, len(byID))
-			// 出图模型旁路留存（/v1/models 以 image_generation 标记列出），照旧不进对话列表。
-			c.stashGenerationModels("global", sortedInfos(byID))
+			if vis := pick.ordered(byID); vis != nil {
+				// 客户端 picker 口径（见 clientpick.go）：哪一族 UA 探测，就按那一族
+				// 自己下发的 agents 名单裁剪——客户端用哪族 UA 就只显示那族的菜单项。
+				// INTL 实测：目录 25 条，菜单 22 条（去掉 paidId deepseek-v4.1-flash-sg
+				// 与 hy-image-3.5 / kling-video-v3 两个媒体模型）。
+				for _, id := range vis {
+					mi := byID[id]
+					if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+						continue
+					}
+					ids = append(ids, id)
+					outInfos = append(outInfos, mi)
+				}
+				ch <- probeResult{names: ids, infos: outInfos}
+				return
+			}
+			// 口径缺失（上游无 agents）：照旧全量 + 排序，保持既有输出稳定语义。
 			for _, mi := range byID {
 				if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 					continue

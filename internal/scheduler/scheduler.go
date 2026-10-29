@@ -146,6 +146,9 @@ type Scheduler struct {
 	// 供面板「到期提醒」标注数据年龄：卡片展示的是这份快照，必须让年龄可读，
 	// 否则界面 5 秒轮询会让人误以为数据也是 5 秒级新鲜。
 	lastBalanceRefresh atomic.Int64
+	// webLeg 网页通道每日活跃的当日去重表（仅国际版，见 webactivity.go）。
+	// 放 Scheduler 上而不是包级变量：多实例/测试各自独立，互不污染。
+	webLeg webLegDay
 }
 
 // New 构建。
@@ -679,10 +682,16 @@ func (s *Scheduler) runCheckin(ctx context.Context, spread bool) {
 		if a == nil || (a.RefreshTokenValue() == "" && !a.IsAPIKey()) {
 			continue
 		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+		// 国际版签到：**不是**「无签到体系」——checkin-activity-status 与 daily-checkin
+		// 两个端点在国际域都存在（2026-10-29 复验：前者 200，后者在活动未开启时
+		// 400 code=10001），国际客户端的 main/account.js 里也有 checkinStatus /
+		// claimDailyCheckin 两个方法。与 CN 的差别只在**判据**：国际版活动长期处于
+		// 未配置状态（active=false、start/end 全空），盲发写请求只会每天撞一次 10001，
+		// 白白多一次风控面。故国际版走「先查 status，仅 active 且当日未签才 claim」。
+		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级
+		// 为 cn、按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global）。
 		if a.IsGlobal() {
+			s.checkinGlobal(a)
 			continue
 		}
 		if !plan.wait(ctx, st.UID) {
@@ -796,9 +805,14 @@ func (s *Scheduler) runActivity(ctx context.Context, spread bool) {
 		cid := session.NewConversationID()
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("WARN: activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-			continue
+		} else {
+			s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
 		}
-		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+		// 国际版另有网页通道腿（issue #111）：上报只点亮连登，每日 30/50 积分认的是
+		// 「跑完的网页 agent 会话」。**放在上报之外**——上报偶发失败不该连带丢掉当日
+		// 积分（两条腿在上游是各自独立的判据）。国内版在 runWebActivityLeg 内部
+		// 按 IsGlobal 直接返回，零上游调用。
+		s.runWebActivityLeg(ctx, a)
 	}
 }
 

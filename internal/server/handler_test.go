@@ -457,6 +457,15 @@ func TestChatSyncEmptyUpstreamBodyIs502(t *testing.T) {
 
 func TestChatStreamPassthrough(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 首帧必须落在**首 token 计时开始之后**：tokensPerSecond 用
+		// (端到端 - TTFB) 作分母，而 TTFB<=0 被定义为「没有观测」→ 不报速率
+		// （handler.go tokensPerSecond 的 ttfb<=0 分支）。
+		//
+		// fake 的 body 是内存 strings.Reader，读首帧几乎零耗时；Windows 的
+		// time.Now() 粒度约 0.5~1ms，两次调用落进同一 tick 时 TTFB 恰好为 0，
+		// 于是 -count=N 或 CI 上偶发 LastTokensPerSecond=nil（本机 30 次复现 11 次、
+		// 与本次改动无关的既有 flake）。显式睡过时钟粒度，让 TTFB 恒 >0。
+		time.Sleep(2 * time.Millisecond)
 		return 200, sseOK, true
 	})
 	h := NewHandler(Config{

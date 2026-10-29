@@ -203,7 +203,7 @@ func TestCNContractGolden(t *testing.T) {
 	_, _ = c.ModelBusy(a, []string{"hy3"})
 	_ = c.RefreshToken(a)
 	_, _ = c.GetCheckinActivityStatus(a)
-	_, _ = c.fetchV3ConfigModelMap(a, "")
+	_, _, _ = c.fetchV3ConfigModelMap(a, "")
 
 	for _, g := range cnGoldenCases {
 		t.Run(strings.TrimPrefix(g.path, "/"), func(t *testing.T) {

@@ -49,27 +49,49 @@ var cnEffortFallback = map[string]effortCap{
 }
 
 // globalEffortFallback global / WorkBuddy 国际版面静态兜底表。
-// 注意 deepseek-v4.1-flash 在国际版**只有 ['high']**（product.ts:190 实测 IDE 缓存），
-// 与 CN 面的三档刻意不同——往 WorkBuddy 上游发 low/max 是非法参数 400。
+//
+// 2026-10-29 WorkBuddy AI 5.9.3 真机核对（带鉴权 GET/POST https://www.workbuddy.ai/v3/config，
+// data.models 25 条，逐条抄 reasoning.supportedEfforts / reasoning.defaultEffort /
+// reasoning.effort）。上一版按 5.8.4 product.ts 与 IDE 缓存抄写，已与实际目录脱节：
+//
+//   - **已下架**（目录里没有，留着只会给出不存在的档位）：gpt-5.5、gpt-5.4、gpt-5.3-codex、
+//     hy4-preview-f、gemini-3.5-flash、kimi-k2.6、glm-5.2；GL 目录里 hy4-preview 才是那个
+//     单档 "high" 的混元模型（-f 是 CN 侧变体命名）。
+//   - **新上架/此前缺失**（远端桶取不到时无档位可报）：glm-5.3-flash、kimi-k3.1-pro、
+//     kimi-k3.1-pro-highspeed、minimax-m3.1-flash、gpt-6-sol、gpt-6-luna、gpt-6.1-sol、
+//     gemini-3.8-flash、grok-4.7、hy4-preview、deepseek-v4.1-flash-sg。
+//   - **deepseek-v4.1-flash 国际版是三档**：旧注释写「国际版只有 high，发 low/max 会 400」，
+//     依据是 5.8.4 的 IDE 缓存；5.9.3 目录已明确下发 supportedEfforts=[low,high,max]。
+//
+// 「单档」形态照旧写成唯一元素的可枚举档（上游用老的 reasoning.effort 键而非数组：
+// fast-model=medium、balanced-model=medium、primary-model=high、kimi-k3=medium），
+// 让 /v1/models 与面板有档位可展示，而不是整段省略。
+//
+// default-model 与两个媒体模型（hy-image-3.5 出图 / kling-video-v3 出视频）目录里没有
+// reasoning 段——不编造，一律不入表。
 var globalEffortFallback = map[string]effortCap{
-	"fast-model":          {efforts: []string{"medium"}},
-	"balanced-model":      {efforts: []string{"medium"}},
-	"primary-model":       {efforts: []string{"high"}},
-	"hy4-preview-f":       {efforts: []string{"high"}, defaultEffort: "high"},
-	"hy3":                 {efforts: []string{"low", "high"}, defaultEffort: "high"},
-	"deepseek-v4.1-flash": {efforts: []string{"high"}},
-	"gpt-6-astra":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.6-sol":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.6-terra":       {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.6-luna":        {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
-	"gpt-5.5":             {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
-	"gpt-5.4":             {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
-	"gpt-5.3-codex":       {efforts: []string{"medium"}},
-	"gemini-3.5-flash":    {efforts: []string{"medium"}},
-	"glm-5.3":             {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
-	"glm-5.2":             {efforts: []string{"high", "xhigh"}, defaultEffort: "high"},
-	"kimi-k3":             {efforts: []string{"medium"}},
-	"kimi-k2.6":           {efforts: []string{"medium"}},
+	"fast-model":              {efforts: []string{"medium"}},
+	"balanced-model":          {efforts: []string{"medium"}},
+	"primary-model":           {efforts: []string{"high"}},
+	"hy4-preview":             {efforts: []string{"high"}, defaultEffort: "high"},
+	"hy3":                     {efforts: []string{"low", "high"}, defaultEffort: "high"},
+	"deepseek-v4.1-flash":     {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"deepseek-v4.1-flash-sg":  {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"glm-5.3":                 {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"glm-5.3-flash":           {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"kimi-k3":                 {efforts: []string{"medium"}},
+	"kimi-k3.1-pro":           {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"kimi-k3.1-pro-highspeed": {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"gpt-5.6-sol":             {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-5.6-terra":           {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-5.6-luna":            {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-6-astra":             {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+	"gpt-6-sol":               {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
+	"gpt-6-luna":              {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
+	"gpt-6.1-sol":             {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
+	"grok-4.7":                {efforts: []string{"low", "medium", "high", "xhigh"}, defaultEffort: "high"},
+	"gemini-3.8-flash":        {efforts: []string{"low", "medium", "high"}, defaultEffort: "medium"},
+	"minimax-m3.1-flash":      {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "max"},
 }
 
 // staticEffortCap 按 realm 取静态兜底条目；未命中返回 zero effortCap（efforts=nil）。

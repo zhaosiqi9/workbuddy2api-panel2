@@ -504,6 +504,17 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	if mi.ReasoningSummary != "" {
 		entry["reasoning_summary"] = mi.ReasoningSummary
 	}
+	// context_window 上游 5.9.3 的上下文档位可选项（contextWindow.defaultLength /
+	// supportedLengths）。与 max_allowed_size / max_input_tokens 是不同口径：后两者是
+	// 当前生效上限，这里列的是客户端**可切换**的档位（如 gpt-6-astra 400000/1000000）。
+	// 上游没声明（两域多数模型都没有）就整体省略——不输出空数组冒充"不支持长上下文"。
+	if len(mi.ContextWindowSupported) > 0 {
+		cw := map[string]any{"supported": mi.ContextWindowSupported}
+		if mi.ContextWindowDefault > 0 {
+			cw["default"] = mi.ContextWindowDefault
+		}
+		entry["context_window"] = cw
+	}
 	return entry
 }
 
