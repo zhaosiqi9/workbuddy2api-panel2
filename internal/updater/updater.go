@@ -32,6 +32,11 @@ const (
 
 // 更新流程的时间参数集中在这里，测试可注入短值。
 var (
+	// exeReleaseBudget 删「刚跑完的 exe」的重试预算（见 removeFileRetrying）。
+	// 实测 Windows 上 Access denied 持续 50~150ms（本机 6 轮里回滚/清理两条路径
+	// 各命中一次，首次必败、一次 20ms 重试即成功），2s 留足余量；真失败时也只
+	// 多花这 2s，不会把更新流程拖住。
+	exeReleaseBudget = 2 * time.Second
 	// downloadStallWindow 下载「N 秒无新字节」卡死守卫窗口。
 	downloadStallWindow = 30 * time.Second
 	// installWatchdog Install「成功」后，等 helper 完成替换的看门狗期限。
@@ -42,6 +47,23 @@ var (
 	// 生命周期（下载+替换+观察窗口）远短于该值，不会误删在途更新。
 	staleTempAge = 6 * time.Hour
 )
+
+// childGrace 生效的健康观察窗口。
+//
+// helper 是**独立进程**（exec 自己），所以测试注入只能经环境变量传下去。为了不让
+// 运维环境里一个随手写的变量把观察窗口缩到无害区（那就等于关掉了「启动即崩就回滚」
+// 这层保护），注入只在夹具模式（WB2API_UPDATE_FIXTURE 非空，仅集成测试会设）下生效。
+func childGrace() time.Duration {
+	if os.Getenv("WB2API_UPDATE_FIXTURE") == "" {
+		return childGraceWindow
+	}
+	if v := strings.TrimSpace(os.Getenv("WB2API_UPDATE_GRACE_MS")); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms >= 0 && ms <= 60000 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return childGraceWindow
+}
 
 // Settings controls the optional daily automatic install.
 type Settings struct {
@@ -559,7 +581,10 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 		if err := waitForProcessExit(pid, 60*time.Second); err != nil {
 			return true, err
 		}
-		return true, os.Remove(args[3])
+		// 进程「已退出」≠ 映像句柄已释放：紧接着删它正在跑的 exe 会被拒（见
+		// removeFileRetrying）。本清理进程存在的唯一目的就是删那个文件，失败即
+		// 意味着 helper 永远残留，所以在这里重试到释放为止。
+		return true, removeFileRetrying(args[3], exeReleaseBudget)
 	}
 	if len(args) < 7 || args[1] != selfUpdateArg {
 		return false, nil
@@ -636,7 +661,7 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 	}
 	// 拉起 ≠ 能跑：配置不兼容、端口被占、依赖缺失都会让新版本启动即退。给它一个
 	// 短的观察窗口，窗口内退出就回滚旧版本（备份还在）；活过窗口才删备份与 helper。
-	if werr := waitChildHealthy(cmd, childGraceWindow); werr != nil {
+	if werr := waitChildHealthy(cmd, childGrace()); werr != nil {
 		if rerr := restore(); rerr != nil {
 			log.Printf("WARN: [updater] 新版本健康检查未通过且回滚失败: %v", rerr)
 		} else if old, serr := startTarget(); serr == nil {
@@ -694,12 +719,44 @@ func replaceBinary(stagePath, targetPath string) error {
 	return nil
 }
 
+// removeFileRetrying 删一个刚被进程执行过的文件，Access denied 时退避重试。
+//
+// 为什么需要：Windows 上 WaitForSingleObject(WAIT_OBJECT_0) 只保证进程**终止**，
+// 不保证它的映像 section 已从文件上解绑；紧接着 DeleteFile 会报 ERROR_ACCESS_DENIED。
+// 本机实测（2026-10-29，updater 集成测试 6 轮）两条路径都命中：
+//
+//	回滚：新版本进程在观察窗口内退出 → remove(target) → Access denied，50~103ms 后重试成功
+//	清理：清理进程等到 helper 退出 → remove(helper) → Access denied，同样短暂
+//
+// 这不是「偶发 IO 错误」而是「删刚跑过的 exe」在 Windows 上的固有行为，所以重试
+// 是正解，不是掩盖症状：不重试的后果是回滚失败（服务停在新版本起不来的状态）或
+// helper 永久残留（每更新一次漏一个文件）。
+//
+// 文件不存在视为成功（幂等）；预算耗尽返回最后一次错误，由调用方决定记日志还是上抛。
+func removeFileRetrying(path string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	wait := 20 * time.Millisecond
+	for {
+		err := os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(wait)
+		if wait < 160*time.Millisecond {
+			wait *= 2
+		}
+	}
+}
+
 // replaceBinaryWithRollback installs stagePath beside targetPath and keeps the
 // previous binary at targetPath+".old" until the caller confirms the new
 // process started. The restore callback is idempotent and best-effort.
 func replaceBinaryWithRollback(stagePath, targetPath string) (restore func() error, cleanup func(), err error) {
 	backup := targetPath + ".old"
-	if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+	if err := removeFileRetrying(backup, exeReleaseBudget); err != nil && !os.IsNotExist(err) {
 		return nil, nil, err
 	}
 	if err := os.Rename(targetPath, backup); err != nil {
@@ -710,7 +767,11 @@ func replaceBinaryWithRollback(stagePath, targetPath string) (restore func() err
 		if restored {
 			return nil
 		}
-		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		// 这里删的 targetPath 是**刚被 exec 过**的新版本：进程已退出，但 Windows
+		// 释放映像 section 有几十毫秒延迟，直接 os.Remove 会 Access denied（实测
+		// 首次必败、50~150ms 后一次重试即成功）。回滚失败 = 用户被留在「新版本起
+		// 不来、旧版本还叫 .old」的半坏状态，所以必须重试而不是把首个错误抛出去。
+		if err := removeFileRetrying(targetPath, exeReleaseBudget); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 		if err := os.Rename(backup, targetPath); err != nil {
@@ -720,7 +781,11 @@ func replaceBinaryWithRollback(stagePath, targetPath string) (restore func() err
 		return nil
 	}
 	cleanup = func() {
-		_ = os.Remove(backup)
+		// 成功路径删备份：backup 是替换前那个进程的映像，可能同样还在释放中。
+		// 失败不再静默吞（旧实现 `_ =`）：残留 .old 会一直躺在程序目录里。
+		if err := removeFileRetrying(backup, exeReleaseBudget); err != nil {
+			log.Printf("WARN: [updater] 清理回滚备份 %s 失败: %v", backup, err)
+		}
 	}
 	if err := os.Rename(stagePath, targetPath); err != nil {
 		return nil, nil, errors.Join(err, restore())

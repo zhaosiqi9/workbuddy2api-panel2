@@ -13,6 +13,36 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
+func TestSaveConfigPreservesAndUpdatesModelFallback(t *testing.T) {
+	cfg := Default()
+	cfg.Pool.ModelFallback = map[string]string{"model-a": "model-b"}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(cfg)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	live := livecfg.New(livecfg.Snapshot{ModelFallback: cfg.Pool.ModelFallback})
+	p := pool.New("")
+	defer p.Close()
+	up := upstream.New()
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
+	for _, tc := range []struct{ body, want string }{
+		{`{"api_key":"changed"}`, "model-b"},
+		{`{"pool":{"model_fallback":{"model-a":"model-c"}}}`, "model-c"},
+		{`{"pool":{"model_fallback":null}}`, ""},
+	} {
+		if _, err := saveConfig([]byte(tc.body), path, live, p, up, sch, nil, nil, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if got := live.Load().ModelFallback["model-a"]; got != tc.want {
+			t.Errorf("save %s: fallback = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+}
+
 // TestSaveConfigReportsActualAndPendingRestarts 重启清单 = 「运行中配置 vs 新配置」的
 // 实际差异：改动即入列、第二处保存不丢上一处的待重启项、改回原值自动清除。
 // 移植上游 PR #104（saveConfig 多传 running 基线；本 fork 多 gw/pn 两参传 nil）。

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -455,6 +456,77 @@ func TestChatSyncEmptyUpstreamBodyIs502(t *testing.T) {
 	}
 }
 
+// ctxBlockingReader 阻塞到 ctx 取消再返回 ctx.Err()：模拟「上游正文还在流、客户端先断开」。
+type ctxBlockingReader struct{ ctx context.Context }
+
+func (r ctxBlockingReader) Read([]byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+// TestChatSyncClientCancelIsNotUpstreamParse 钉住客户端断开的分支：上游正文流到一半、
+// 客户端先掐断（AsyncOpenAI 类客户端常见 timeout=15s / 用户点停止）时，不再记
+// 502 upstream_parse —— 上游当时在正常输出，网关没出错。线上一天 11 次这类 502，
+// 全部恰好 total=15.0s、tok=-、do=1.4~2.9s，被统计成了账号故障。
+// 断言三件事：不写响应体（连接已关）、错误汇总归到「客户端中断」而非解析失败、handler 不卡死。
+func TestChatSyncClientCancelIsNotUpstreamParse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	var once sync.Once
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			once.Do(func() { close(entered) })
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(ctxBlockingReader{ctx}),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":false,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	var buf strings.Builder
+	old := log.Writer()
+	log.SetOutput(&buf) // 进程级全局，本测试不 t.Parallel
+	done := make(chan struct{})
+	go func() { h.ServeHTTP(rec, req); close(done) }()
+	<-entered
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.SetOutput(old)
+		t.Fatal("handler 未在 ctx 取消后返回（卡在读上游）")
+	}
+	log.SetOutput(old)
+	if rec.Body.Len() != 0 {
+		t.Fatalf("客户端已断开，不该还写响应体: %s", rec.Body.String())
+	}
+	out := buf.String()
+	if strings.Contains(out, "upstream parse failed") {
+		t.Fatalf("客户端断开不该记成上游解析失败: %s", out)
+	}
+	if !strings.Contains(out, "调用方断开") {
+		t.Fatalf("应落一条调用方断开的日志: %s", out)
+	}
+	if !strings.Contains(out, "EdgeOne") {
+		t.Fatalf("日志应点出 CDN 回源超时这条真实成因: %s", out)
+	}
+	// 该行的 "context canceled" 由错误汇总归为 info 级「客户端中断」（规则见
+	// internal/panel/errors.go:80，errors_test.go 已钉住），这里只确认原文没丢。
+	if !strings.Contains(out, "context canceled") {
+		t.Fatalf("断开原因原文应留在日志里，才能被错误汇总归类: %s", out)
+	}
+}
+
 func TestChatStreamPassthrough(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		// 首帧必须落在**首 token 计时开始之后**：tokensPerSecond 用
@@ -641,13 +713,9 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
-	}
-	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
-		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
+	assertModelCooling(t, p, "bad", "glm-5.2", soft)
+	if p.PickByUIDForModel("bad", "deepseek-v4.1-flash") == nil {
+		t.Fatal("模型侧限流不得阻断同账号的其他模型")
 	}
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
@@ -781,13 +849,7 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
-	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
-		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
-	}
+	assertModelCooling(t, p, "bad", "glm-5.2", 600*time.Second)
 }
 
 // TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。

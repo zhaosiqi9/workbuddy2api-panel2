@@ -57,6 +57,105 @@ func postEmbeddings(h *Handler, body string) *httptest.ResponseRecorder {
 	return rec
 }
 
+func TestEmbeddingsRespectsModelPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, body      string
+		allowed, hidden []string
+		want            int
+	}{
+		{"allowlist rejects", `{"model":"bge-m3","input":["a","b"]}`, []string{"cn:other"}, nil, 400},
+		{"hidden rejects", `{"model":"cn:bge-m3","input":["a","b"]}`, nil, []string{"cn:bge-m3"}, 400},
+		{"explicit realm rejects", `{"model":"global:bge-m3","realm":"cn","input":["a","b"]}`, []string{"global:bge-m3"}, nil, 400},
+		{"allowed succeeds", `{"model":"bge-m3","input":["a","b"]}`, []string{"cn:bge-m3"}, nil, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &embedFake{status: 200, body: embedOKBody}
+			h := embedHandler(t, f, true)
+			h.cfg.ModelsAllowed, h.cfg.ModelsHidden = tc.allowed, tc.hidden
+			rec := postEmbeddings(h, tc.body)
+			if rec.Code != tc.want {
+				t.Fatalf("status=%d want=%d: %s", rec.Code, tc.want, rec.Body.String())
+			}
+			if tc.want != 200 && len(f.paths) != 0 {
+				t.Fatal("rejected model reached upstream")
+			}
+		})
+	}
+}
+
+func TestEmbeddingsRejectsMalformedVectors(t *testing.T) {
+	for _, data := range []string{`[null]`, `[{}]`, `[{"embedding":null}]`, `[{"embedding":[]}]`, `[{"embedding":["bad"]}]`} {
+		t.Run(data, func(t *testing.T) {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Errorf("malformed upstream response panicked: %v", p)
+				}
+			}()
+			f := &embedFake{status: 200, body: `{"data":` + data + `}`}
+			rec := postEmbeddings(embedHandler(t, f, true), `{"model":"bge-m3","input":"a"}`)
+			if rec.Code != 502 {
+				t.Fatalf("status=%d want=502: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestEmbeddingsRejectsOversizedBody(t *testing.T) {
+	f := &embedFake{status: 200, body: embedOKBody}
+	body := `{"model":"bge-m3","input":["a","b"]}`
+	// A valid JSON prefix followed by whitespace must not hide an oversized body.
+	body += strings.Repeat(" ", (8<<20)+1-len(body))
+	rec := postEmbeddings(embedHandler(t, f, true), body)
+	if rec.Code != 413 || len(f.paths) != 0 {
+		t.Fatalf("status=%d upstream calls=%d", rec.Code, len(f.paths))
+	}
+}
+
+func TestEmbeddingsPreservesUpstreamIndices(t *testing.T) {
+	f := &embedFake{status: 200, body: `{"data":[{"index":1,"embedding":[0.2]},{"index":0,"embedding":[0.1]}]}`}
+	rec := postEmbeddings(embedHandler(t, f, true), `{"model":"bge-m3","input":["a","b"]}`)
+	var got struct {
+		Data []struct {
+			Index     int
+			Embedding []float64
+		}
+	}
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil {
+		t.Fatalf("response: %d %s", rec.Code, rec.Body.String())
+	}
+	if got.Data[0].Index != 1 || got.Data[0].Embedding[0] != 0.2 || got.Data[1].Index != 0 {
+		t.Fatalf("vectors were assigned to the wrong input: %s", rec.Body.String())
+	}
+	for _, data := range []string{
+		`[{"index":2,"embedding":[0.1]}]`,
+		`[{"index":0.5,"embedding":[0.1]}]`,
+		`[{"index":null,"embedding":[0.1]}]`,
+	} {
+		f.body = `{"data":` + data + `}`
+		if rec := postEmbeddings(embedHandler(t, f, true), `{"model":"bge-m3","input":"a"}`); rec.Code != 502 {
+			t.Errorf("accepted invalid index: %s", rec.Body.String())
+		}
+	}
+	f.body = `{"data":[{"index":0,"embedding":[0.1]},{"index":0,"embedding":[0.2]}]}`
+	if rec := postEmbeddings(embedHandler(t, f, true), `{"model":"bge-m3","input":["a","b"]}`); rec.Code != 502 {
+		t.Errorf("accepted duplicate index: %s", rec.Body.String())
+	}
+}
+
+func TestEmbeddingsQueueDoesNotRotate(t *testing.T) {
+	// 6020/6021 是全局队列：换号只会多撞一次墙。终态 429（与 chat 同口径），不罚号不轮转。
+	for _, status := range []int{200, 429} {
+		f := &embedFake{status: status, body: `{"code":6020,"msg":"queue.waiting.title","data":{"retry_after":40}}`}
+		rec := postEmbeddings(embedHandler(t, f, true), `{"model":"bge-m3","input":"a"}`)
+		if rec.Code != 429 || len(f.paths) != 1 {
+			t.Errorf("queue status=%d: response=%d calls=%d", status, rec.Code, len(f.paths))
+		}
+		if got := rec.Header().Get("Retry-After"); got != "40" {
+			t.Errorf("queue status=%d: Retry-After=%q want 40", status, got)
+		}
+	}
+}
+
 // TestEmbeddingsDisabledByDefault 默认关闭：回 403 embeddings_disabled 且不打上游。
 //
 // 为什么不是 404：404 会让调用方以为「路径拼错了」，而实际是功能存在、只是没开。

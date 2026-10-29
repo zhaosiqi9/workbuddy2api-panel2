@@ -1087,6 +1087,7 @@ func (c *Client) brandScopeGlobal() bool {
 // 返回改写后的请求体、客户端原始请求档位与本次实际生效档位
 // （requested 与 effective 的区别见 prepareBodyOpt 注释；issue #43）。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]byte, string, string) {
+	body = prepareKimiTools(body, realm)
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	maxOut := c.modelMaxOutSnapshot(realm)
 	if realmKey(realm) == "global" {

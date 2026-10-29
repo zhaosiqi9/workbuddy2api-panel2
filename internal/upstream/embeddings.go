@@ -73,20 +73,28 @@ func (c *Client) Embeddings(ctx context.Context, a *auth.Auth, model string, inp
 	if env.Code == 11351 {
 		return nil, fmt.Errorf("%w: %s", ErrEmbeddingModelNotFound, truncate(env.Msg, 160))
 	}
-	if resp.StatusCode >= 400 {
+	// 限流/排队的等待口径随信封带出：头优先，6020/6021 的 data.retry_after 兜底
+	// （与 chat 链路同口径，见 parseQueueRetryAfter）。缺了它 handler 只能按基数冷却。
+	upErr := func() *Error {
 		kind := Classify(resp.StatusCode, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		if d, ok := ParseRetryAfter(resp.Header); ok {
+			ue.RetryAfter = d
+		} else if kind == ErrUpstreamBusy {
+			if d, ok := parseQueueRetryAfter(raw); ok {
+				ue.RetryAfter = d
+			}
+		}
+		return ue
+	}
+	if resp.StatusCode >= 400 {
+		return nil, upErr()
 	}
 	if env.Code != 0 {
-		kind := Classify(resp.StatusCode, env.Msg)
-		if kind == ErrNone {
-			kind = ErrClient
-		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode,
-			Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return nil, upErr()
 	}
 	return json.RawMessage(raw), nil
 }

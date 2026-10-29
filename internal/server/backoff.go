@@ -86,6 +86,25 @@ func isModelBusyReason(reason string) bool {
 	return upstream.IsModelBusy(reason) || strings.Contains(reason, "14003")
 }
 
+// waitForSlot 在「号都在途占满」时等一个空名额：轮询 slotPoll，上限 busyWaitCap
+// （与 14003 那个 busy-wait 共用同一预算，不引入新开关）。返回 false = 客户端断连。
+// 等到名额、或池况变成别的原因（冷却/停牌）都提前收手——由调用方重选一次定论。
+func waitForSlot(ctx context.Context, p *pool.Pool, model, realm string) bool {
+	deadline := time.Now().Add(busyWaitCap)
+	for time.Now().Before(deadline) {
+		if !sleepCtx(ctx, slotPoll) {
+			return false
+		}
+		if !p.SlotWaitForRealm(model, realm) {
+			return true
+		}
+	}
+	return true
+}
+
+// slotPoll 等在途名额的轮询间隔：名额是按请求收尾释放的，几十毫秒内必有一次，不必更密。
+const slotPoll = 50 * time.Millisecond
+
 // waitPast 等待到解封时刻：只在 d 之上加**正向**抖动（0 ~ +25%），绝不提前醒来。
 //
 // 不能用 jitterDur：那是双向 ±25%，抽到小于 1 的系数时会在冷却还没解除时就醒，

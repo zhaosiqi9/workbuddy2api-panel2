@@ -848,6 +848,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		ThinkingClientPriority: newCfg.Thinking.ClientPriority,
 		ThinkingOverrideScope:  newCfg.Thinking.OverrideScope,
 		ThinkingModelDefaults:  newCfg.Thinking.ModelDefaults,
+		ModelFallback:          newCfg.Pool.ModelFallback,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)

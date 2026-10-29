@@ -219,6 +219,10 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // 与旧实现的差异：有上游重置时间时绝对不做指数堆加；无重置时间时，「冷却中兜底
 // 探测再 429」不再 softStreak++ 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
+	if model == "" {
+		p.CooldownSoftRate(uid, base, resetAt, reason)
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -253,6 +257,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			clearRoutingModelCooldownsLocked(e)
 		} else {
 			// 无解析时间：把 **(号, 模型)** 停车，而不是整号冷却。
+			if old, ok := e.modelCooldowns[model]; ok && !old.AuditOnly && old.Until.After(now) {
+				return // 并发失败不能延长正在生效的模型冷却。
+			}
 			//
 			// 为什么必须模型级：6004/14003 的语义都是「这个模型忙/额度紧」，上游文案就是让
 			// 客户端换模型，实测同号换模型立刻可用。按账号冷却是把「一个模型抖动」放大成

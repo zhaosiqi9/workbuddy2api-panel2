@@ -871,7 +871,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return ""
 		}
 		to := m[curModel]
-		if to == "" || to == curModel || fallbackTried[to] {
+		if to == "" || to == curModel || fallbackTried[to] || !h.allowedModel(realm, to) || h.hiddenModel(realm, to) {
 			return ""
 		}
 		return to
@@ -943,6 +943,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var modelBlock pool.ModelBlockStatus
 	// busyWaited 本次请求是否已经为「模型繁忙」等过一轮（issue #46，见 acct==nil 分支）。
 	busyWaited := false
+	// slotWaited 本次请求是否已经为「号都在途占满」等过一轮名额（issue #117）。
+	slotWaited := false
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -1205,6 +1207,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 				}
+			}
+			// issue #117：全池该模型没号，但原因不是冷却而是**在途占满**时，等一个
+			// 名额再试一次。此前直接 503「all accounts are temporarily unavailable」，
+			// 而真实情况是并发把剩下的号打满了 max_in_flight：两号池里一号撞 6004 锁
+			// 模型后只剩 3 个名额，第 4 个并发请求必然 503，其实几十毫秒后就有名额。
+			// 只等一次、不占在途名额；上限 busyWaitCap（与 14003 同一预算）。
+			// 放在 14003 busy-wait 之后：那是有解封时刻的确定性等待，优先级更高。
+			if !slotWaited && h.cfg.Pool.SlotWaitForRealm(curModel, realm) {
+				slotWaited = true
+				log.Printf("slot-wait: model=%s realm=%q all healthy accounts at in-flight cap, waiting up to %s then retry once (issue #117)",
+					bareModel, realm, busyWaitCap)
+				if !waitForSlot(r.Context(), h.cfg.Pool, curModel, realm) {
+					break // 客户端已断连：不必再等
+				}
+				i-- // 等待不算一次换号：槽位留给真正的尝试
+				continue
 			}
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
@@ -1658,6 +1676,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			// 调用方先走了（前置 CDN 回源超时、AsyncOpenAI 类客户端 timeout、用户点停止）：
+			// 上游当时还在正常输出，网关也没出错。此前一律记 502 upstream_parse，把别人掐断
+			// 报成上游故障——线上一天 11 次，全部恰好 total=15.0s、tok=-、do=1~3s（上游头已回、
+			// 正文还在流），src 全是 43.174/43.175 的 EdgeOne 回源节点。
+			// 实测（2026-10-29）：EdgeOne 回源默认 15s 超时，直连与非 EdgeOne 入口同请求 39.4s / 16.8s 均 200。
+			// 499 = nginx 的 client closed request，与真 5xx 一眼可分；不写响应体（连接已关）。
+			// 文案保留 err 原文（含 "context canceled"），错误汇总按「客户端中断/info」归类。
+			if cerr := r.Context().Err(); cerr != nil {
+				log.Printf("WARN: [server] sync acct=%s model=%s: 调用方断开（%v），上游输出已丢弃（CDN 回源超时常见于 EdgeOne 默认 15s）",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, cerr)
+				st.status = 499
+				st.outcome = reqlog.OutcomeInterrupted
+				return
+			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			// 与流式空流那条 WARN 对称——此前这条只写响应不落日志，运维侧只能看到
 			// 一行 sync 502，无从判断是上游空体还是别的（同一失败在流式路径有 WARN）。
@@ -1853,6 +1885,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if !modelBlock.Until.IsZero() {
 			hint += "; resets at " + modelBlock.Until.Format(time.RFC3339)
 		}
+	} else if modelBlockAllSoftRate(modelBlock) {
+		status = http.StatusTooManyRequests
+		code = "rate_limit_exceeded"
+		msg = "this model is rate limited on every account; wait for cooldown or choose another model"
+		hint = fmt.Sprintf("model_rate_limit: %d account(s) cooling down this model", modelBlock.Count)
+		if !modelBlock.Until.IsZero() {
+			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
+		}
 	} else if modelBlock.Blocked && modelBlockIsTransient(modelBlock.Reason) {
 		// 全池该模型只是「忙」（14003：模型繁忙，等一等就好）；6004/6000 的用量配额
 		// 已在上面按不可重试处置，走到这里的是「等有意义」的那一类。
@@ -1953,6 +1993,20 @@ func modelBlockIsTransient(reason string) bool {
 		}
 	}
 	return false
+}
+
+// modelBlockAllSoftRate 将普通模型限流与模型不存在、无权限和瞬时繁忙区分。
+func modelBlockAllSoftRate(blk pool.ModelBlockStatus) bool {
+	if !blk.Blocked || len(blk.Reasons) == 0 {
+		return false
+	}
+	for _, reason := range blk.Reasons {
+		if !strings.HasPrefix(reason, "429 model rate limit") &&
+			(!upstream.IsModelRateLimit(reason) || upstream.IsModelBusy(reason)) {
+			return false
+		}
+	}
+	return true
 }
 
 // modelBlockAllQuota 报告「全池该模型被挡」是否清一色是「用量配额」型：上游 6004/6000
@@ -2106,8 +2160,7 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //
 // 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
+//   - ErrSoftRate → 聊天限流均按模型隔离；优先对齐上游重置墙钟，无时间才走有界退避。冷却时长优先采信
 //     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却：**不 Disable**——WAF 403 是 IP/指纹维频控信号，
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
@@ -2141,16 +2194,18 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
+		// 聊天限流按账号+模型隔离，无模型上下文时仍由池退回账号级冷却。
+		_, model = upstream.SplitRealmPrefix(model)
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，就精确冷却到该墙钟、绝不
 		// 指数堆加。
 		//   - 模型级（6004 / 14003）→ CooldownSoftForModel：写 modelCooldowns[model]，
 		//     切模型豁免。**无论有没有解析时间都走这条**——模型忙不是账号坏，按账号冷却
 		//     会把一个模型的抖动放大成整池停摆（实测同号换模型立刻可用）。
-		//   - 账号级（其余 429 文案）→ CooldownSoftRate：写账号级 until。
+		// 其余普通 429 同样只停当前模型，不扩大为整号冷却。
 		modelRateLimited := upstream.IsModelRateLimit(body)
 		// 模型级冷却的 reason 直接存上游原文（不是固定串）：面板要能看出「为什么锁」，
 		// 锁池命中时客户端也要拿到上游话术（6004「使用量已超出频率限制，将在 … 重置」）。
-		// 账号级冷却仍用下面的固定文案（那是"这个号被限流"，与模型无关）。
+		// 普通 429 增加模型级标记，保证冷却期间的本地响应仍是 429。
 		modelReason := "model rate limit"
 		if s := strings.TrimSpace(body); s != "" {
 			modelReason = s
@@ -2160,7 +2215,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, modelReason)
 				return
 			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "429 model rate limit: "+body)
 			return
 		}
 		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
@@ -2173,21 +2228,19 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			// 14003 是「模型繁忙」：没有恢复时刻，上游文案就是让客户端换模型/稍后
 			// 重试，不是这个号被限流。给独立短窗口（10s 起、封顶 1m），不套 soft_rate
 			// 的 600s→2h 阶梯，否则一次抖动就是十分钟不可用。
-			if retryAfter.IsZero() && upstream.IsModelBusy(body) {
+			if model != "" && retryAfter.IsZero() && upstream.IsModelBusy(body) {
 				h.cfg.Pool.CooldownModelBusy(uid, model, "14003 model busy")
 				return
 			}
 			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, modelReason)
 			return
 		}
-		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
-		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
-		// （热改优先），管理面板改 soft_rate 后立即生效。
-		reason := "429 rate limit"
+		// 无重置时间时使用模型级有界退避；重复失败不延长当前冷却。
+		reason := "429 model rate limit: " + body
 		if !retryAfter.IsZero() {
-			reason = "429 rate limit (retry-after)"
+			reason += " (retry-after)"
 		}
-		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), retryAfter, reason)
+		h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, reason)
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
 		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶

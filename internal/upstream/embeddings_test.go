@@ -89,3 +89,12 @@ func TestEmbeddingsHTTPErrorClassified(t *testing.T) {
 		t.Errorf("status=%d kind=%v want 503 / 非空 Kind", ue.Status, ue.Kind)
 	}
 }
+
+func TestEmbeddingsClassifiesBusinessEnvelope(t *testing.T) {
+	c := embedClient(200, `{"code":6020,"msg":"queue.waiting.title"}`, nil)
+	_, err := c.Embeddings(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"}, "bge-m3", []string{"x"})
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrUpstreamBusy {
+		t.Fatalf("queue envelope misclassified: %v", err)
+	}
+}

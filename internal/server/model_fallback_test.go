@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -97,6 +98,31 @@ func doFallbackChat(h *Handler, model string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 	return rec
+}
+
+func TestModelFallbackRespectsModelPolicy(t *testing.T) {
+	for _, hidden := range []bool{false, true} {
+		t.Run(fmt.Sprint("hidden=", hidden), func(t *testing.T) {
+			up := &modelAwareUpstream{reply: []struct {
+				status int
+				body   string
+			}{
+				{429, rateLimit6004Body}, {200, okChatSSE},
+			}}
+			h := newFallbackHandler(map[string]string{"model-a": "model-b"}, up.client())
+			if hidden {
+				h.cfg.ModelsHidden = []string{"model-b"}
+			} else {
+				h.cfg.ModelsAllowed = []string{"model-a"}
+			}
+			doFallbackChat(h, "model-a")
+			for _, model := range up.seen() {
+				if model == "model-b" {
+					t.Fatal("fallback bypassed model policy")
+				}
+			}
+		})
+	}
 }
 
 // TestModelFallbackOn6004 核心行为：v4.1 被 6004 → 同账号改用 v4 → 成功。

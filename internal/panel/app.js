@@ -481,15 +481,47 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+let accRealmFilter = 'all';
+let lastAccountsList = [];
+
 function renderAccounts(list) {
+  lastAccountsList = Array.isArray(list) ? list : [];
   const tb = $('accBody');
-  if (!list.length) {
-    setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
+  const total = lastAccountsList.length;
+  const globalCnt = lastAccountsList.filter(s => s.realm === 'global').length;
+  const cnCnt = total - globalCnt;
+
+  const elTabs = $('accRealmTabs');
+  if (elTabs) {
+    const cAll = $('accCntAll'), cCn = $('accCntCn'), cGl = $('accCntGlobal');
+    if (cAll) cAll.textContent = total;
+    if (cCn) cCn.textContent = cnCnt;
+    if (cGl) cGl.textContent = globalCnt;
+    elTabs.querySelectorAll('button[data-realm]').forEach(b => {
+      b.classList.toggle('on', b.dataset.realm === accRealmFilter);
+    });
+  }
+
+  let filtered = lastAccountsList;
+  if (accRealmFilter === 'cn') {
+    filtered = lastAccountsList.filter(s => s.realm !== 'global');
+  } else if (accRealmFilter === 'global') {
+    filtered = lastAccountsList.filter(s => s.realm === 'global');
+  }
+
+  if (!filtered.length) {
+    if (!total) {
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
+    } else if (accRealmFilter === 'cn') {
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国内版账号</div>当前账号池内均为国际版账号（共 ' + globalCnt + ' 个）</div></td></tr>');
+    } else if (accRealmFilter === 'global') {
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国际版账号</div>当前账号池内均为国内版账号（共 ' + cnCnt + ' 个）</div></td></tr>');
+    }
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
-  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  setHTML(tb, list.map(s => {
+  const maxCred = Math.max(1, ...filtered.map(s => s.credits || 0));
+  setHTML(tb, filtered.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
@@ -554,9 +586,14 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    const rawWho = s.nickname || s.uid || '';
+    const nameHtml = remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
+    const tags = (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') +
+      (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
+      (s.api_key ? ' <span class="realm-tag">API Key</span>' : '');
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm"><span class="nm-name" title="' + esc(rawWho) + '">' + nameHtml + '</span>' + tags + '</div><div class="id" title="uid: ' + esc(s.uid) + '">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -572,7 +609,7 @@ function renderAccounts(list) {
         // 无个人成长体系的账号（企业版 / 静态 API Key）不渲染「签到」「任务」：前者
         // 上游 400「企业账号不支持该操作」，后者 403 growth-only；只留「额度」，点它走
         // /balance，额度由 upstream 的企业口径端点（get-enterprise-user-usage）填充。
-        // 七个动作按固定槽位输出，缺位留空 span —— CSS 用 grid 固定列宽，逐行对齐。
+        // 八个动作按固定槽位输出，缺位留空 span —— CSS 用 grid 固定列宽，逐行对齐。
         // 「探活」单独占一槽（仅封禁态渲染）：它与「解冻」是两个独立动作，若挤在同一
         // 槽里输出两个按钮，冻结行的列数就与其它行不同，整列又会错位。
         (personal ?
@@ -585,6 +622,7 @@ function renderAccounts(list) {
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (personal ? '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额' : '退出选号，但照常保活 / 刷新额度') + '">暂停选号</button>')),
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>'),
+        '<button class="xs ghost" data-a="remark" data-u="' + esc(s.uid) + '" title="给这个账号起个本机备注（只存浏览器）">备注</button>',
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>',
       ].map(html => html || '<span class="slot" aria-hidden="true"></span>').join('') +
       '</div></td></tr>';
@@ -758,6 +796,8 @@ $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
+  // 行内「备注」只开本机编辑器，不打后端接口：提前返回，跳过下面的 disable 与 confirm。
+  if (a === 'remark') { openRemarks(u); return; }
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
@@ -826,6 +866,16 @@ $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 };
+if ($('accRealmTabs')) {
+  $('accRealmTabs').addEventListener('click', ev => {
+    const btn = ev.target.closest('button[data-realm]');
+    if (!btn) return;
+    const r = btn.dataset.realm;
+    if (r === accRealmFilter) return;
+    accRealmFilter = r;
+    renderAccounts(lastAccountsList);
+  });
+}
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
@@ -4007,25 +4057,33 @@ function remarkFormRows() {
   }
   return rows;
 }
-function renderRemarkBody() {
+/* onlyUID 非空时只渲染该账号一行（账号池行内「备注」按钮走这条），避免为改一个号
+   在几十行里翻找。 */
+function renderRemarkBody(onlyUID) {
   const box = $('remarkBody');
   if (!box) return;
-  const rows = remarkFormRows();
+  let rows = remarkFormRows();
+  if (onlyUID) {
+    const k = remarkKey(onlyUID);
+    rows = rows.filter(r => r.uid === k);
+  }
   box.innerHTML = rows.length
     ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
         '<input type="text" data-uid="' + esc(r.uid) + '" value="' + esc(remarksAll()[r.uid] || '') + '" placeholder="备注（留空即清除）" maxlength="24"></div>').join('')
     : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
 }
-function openRemarks() {
-  renderRemarkBody();
+function openRemarks(onlyUID) {
+  renderRemarkBody(typeof onlyUID === 'string' ? onlyUID : '');
   if ($('remarkVeil')) $('remarkVeil').classList.add('on');
 }
 function closeRemarks() { if ($('remarkVeil')) $('remarkVeil').classList.remove('on'); }
 function saveRemarkForm() {
-  const map = {};
+  // 在现有映射上合并：单账号编辑器里只有一行，整体替换会把其它号的备注全清掉。
+  const map = Object.assign({}, remarksAll());
   document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
-    const v = inp.value.trim();
-    if (v) map[inp.getAttribute('data-uid')] = v;
+    const k = inp.getAttribute('data-uid'), v = inp.value.trim();
+    if (v) map[k] = v;
+    else delete map[k];
   });
   const saved = storeRemarks(map);
   closeRemarks();
@@ -4034,7 +4092,7 @@ function saveRemarkForm() {
   else if (view === 'usage' && usageData) renderUsage(usageData);
   toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
 }
-if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
+if ($('btnRemarks')) $('btnRemarks').onclick = () => openRemarks('');
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
 if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => {
   if (!storeRemarks({})) toast('清空未能写入浏览器存储，刷新后备注会回来', 'err');

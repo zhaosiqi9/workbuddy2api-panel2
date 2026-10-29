@@ -268,14 +268,16 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* .radios label 里的单选框必须收成控件自身宽度：面板全局给 form input 设了
    100% 宽 + block，直接套到 radio 上会把整行文字挤成竖排（label 高 200~400px）。 */
 .radios input { margin-top: 3px; flex: none; width: auto; display: inline-block; }
-.who { min-width: 118px; max-width: 200px; }
+.who { min-width: 130px; max-width: 240px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
-.who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm { display: flex; align-items: center; gap: 5px; min-width: 0; font-weight: 550; }
+.who .nm .nm-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm .realm-tag { flex: none; margin-left: 0; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
+.realm-tag { display: inline-block; padding: 1px 5px; border-radius: 4px; font: 500 10px/1.1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); white-space: nowrap; vertical-align: middle; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
@@ -330,11 +332,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
    导致 vertical-align:middle 失效（按钮整体偏上、行线不齐）。这里强制恢复
    table-cell，让该列和其他列一样参与行高与垂直居中；按钮排列交给内层 .acts-inner。 */
 td.acts { display: table-cell; vertical-align: middle; text-align: right; }
-/* 账号池操作列：每个动作占固定槽位（签到 / 余额 / 任务 / 选号 / 禁用 / 移除），
+/* 账号池操作列：每个动作占固定槽位（签到 / 余额 / 任务 / 探活 / 选号 / 禁用 / 备注 / 移除），
    缺哪个留空槽。否则「解冻 / 暂停选号 / 恢复选号」互斥会改变按钮个数，整列左右错位。
    分列放在内层 div：td 保持 table-cell，vertical-align:middle 才继续生效
    （直接给 td 设 display:grid 会退出表格布局，按钮变顶对齐）。 */
-.acts-inner { display: grid; grid-template-columns: repeat(4, 54px) 68px repeat(2, 54px); gap: 5px; justify-content: end; align-items: center; }
+.acts-inner { display: grid; grid-template-columns: repeat(4, 54px) 68px repeat(3, 54px); gap: 5px; justify-content: end; align-items: center; }
 /* 统一盒模型：primary 与 ghost 的边框/行高不同会让「解冻」行比「暂停选号」行高 2~3px，
    行线因此参差。固定高度 + border-box 后每行等高、按钮底边对齐。 */
 .acts-inner button { width: 100%; height: 26px; box-sizing: border-box; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
@@ -859,6 +861,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="box">
         <header>
           <h3>账号池</h3>
+          <span class="vtabs" id="accRealmTabs">
+            <button type="button" data-realm="all" class="on">全部<span class="cnt" id="accCntAll">0</span></button>
+            <button type="button" data-realm="cn">国内版<span class="cnt" id="accCntCn">0</span></button>
+            <button type="button" data-realm="global">国际版<span class="cnt" id="accCntGlobal">0</span></button>
+          </span>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
           <button class="xs" id="btnRemarks">备注</button>
