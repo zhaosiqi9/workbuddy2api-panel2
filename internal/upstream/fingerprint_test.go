@@ -23,16 +23,18 @@ func globalAuth() *auth.Auth {
 }
 
 // v3ProbeUACNForTest 国内版 /v3/config 实测 UA（默认 Client、CN 账号）。
-// 2026-10-28 国内 5.9.3 抓包：`WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`
-// （带鉴权的三条 /v3/config 全是三段式；未鉴权那条是两段式 `WorkBuddy/5.9.3 CLI/2.165.0`）。
-const v3ProbeUACNForTest = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
+//
+// 2026-10-30 国内 5.9.3 抓包复核：真机 /v3/config 是**两段式**
+// `WorkBuddy/5.9.3 CLI/2.165.0`。同一账号同一 token 用三段 / 两段分别打，
+// 返回逐字节相同的 64866 字节（61 模型 / agents=cli:16）——UA 家族不再分流。
+const v3ProbeUACNForTest = "WorkBuddy/5.9.3 CLI/2.165.0"
 
 // TestUARealmBrand 首段恒驼峰 WorkBuddy，只有第二段品牌随 realm 变。
 //
-// 2026-10-21 国际版 5.8.4 GUI 真机抓包（/v2/chat/completions 主对话 + 标题生成）：
+// 2026-10-30 双版本真机抓包（chat 链 /v2/chat/completions）：
 //
-//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0     （7 条 chat 实测）
-//	global 5.8.4 → WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0  （chat 链路实测）
+//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+//	global 5.9.4 → WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
 //
 // 关键：首段永远是驼峰 `WorkBuddy`——官方 chat 走 OpenAI SDK 的 buildUserAgent，
 // 首段取 productName 原样，第二段才是打包期改写的 slug。曾把 global 首段也写成
@@ -44,7 +46,7 @@ func TestUARealmBrand(t *testing.T) {
 	if got, want := c.userAgent(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN UA=%q want %q", got, want)
 	}
-	if got, want := c.userAgent(globalAuth()), "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0"; got != want {
+	if got, want := c.userAgent(globalAuth()), "WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0"; got != want {
 		t.Errorf("global UA=%q want %q", got, want)
 	}
 	// 显式配置仍然赢（用户自定义品牌/版本）。
@@ -55,26 +57,27 @@ func TestUARealmBrand(t *testing.T) {
 	}
 }
 
-// TestV3ProbeUAOfficial 目录探测 UA 必须两版各一处官方形态，不能是 CodeBuddy 家族。
+// TestV3ProbeUAOfficial 目录探测 UA 必须是官方真实形态，不能是 CodeBuddy 家族。
 //
-// 真机实测两版对同一 /v3/config 端点发的 UA 不同：
+// 2026-10-30 双版本真机 /v3/config UA **同一形态**（两段、单品牌）：
 //
-//	CN     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0  （三段，重复品牌）
-//	global → WorkBuddy/5.8.4 CLI/2.165.0                  （两段，单品牌）
+//	CN 5.9.3     → WorkBuddy/5.9.3 CLI/2.165.0
+//	global 5.9.4 → WorkBuddy/5.9.4 CLI/2.165.0
 //
-// 旧实现发 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` / `CLI/2.63.2 CodeBuddy/2.63.2`：
-// 这两个串在 WorkBuddy 分发包里根本不存在（只有 WorkBuddy 形态），属最显眼的指纹。
+// 旧实现给 CN 发三段重复品牌（5.8.3 时代的抓包结论），5.9.3 已不成立：同 token
+// 三段/两段返回逐字节相同。更早的 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` /
+// `CLI/2.63.2 CodeBuddy/2.63.2` 两个串在 WorkBuddy 分发包里根本不存在。
 func TestV3ProbeUAOfficial(t *testing.T) {
 	c := New()
 	cn := &auth.Auth{UID: "u-c", AccessToken: "at"}
 
-	if got, want := c.v3ProbeUA(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
+	if got, want := c.v3ProbeUA(cn), "WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN v3ProbeUA=%q want %q", got, want)
 	}
-	if got, want := c.v3ProbeUA(globalAuth()), "WorkBuddy/5.8.4 CLI/2.165.0"; got != want {
+	if got, want := c.v3ProbeUA(globalAuth()), "WorkBuddy/5.9.4 CLI/2.165.0"; got != want {
 		t.Errorf("global v3ProbeUA=%q want %q", got, want)
 	}
-	// 第二路（单品牌两段式）在 CN 下与主路不同，才有多目录覆盖的意义。
+	// 第二路与主路同串（真机只有这一种形态；双路只为沿用 global 的并集调用链）。
 	if got, want := c.v3ProbeUALite(cn), "WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN v3ProbeUALite=%q want %q", got, want)
 	}
@@ -257,7 +260,7 @@ func TestDesktopReportFingerprintPerRealm(t *testing.T) {
 		{"CN", &auth.Auth{UID: "u-c", AccessToken: "at", Nickname: "cn"},
 			"5.9.3", "d46924219e79332f49c37ccebf27292f87001b19", 1793093056315, true},
 		{"global", globalAuth(),
-			"5.8.4", "73952edb48da46bd0b244661efe22f4f247c4977", 1792063084107, false},
+			"5.9.4", "fa0a0901906addaa1a4259f6df347388a5563ded", 1793288804029, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -295,8 +298,15 @@ func TestDesktopUAPerRealm(t *testing.T) {
 	if got, want := desktopUAFor(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
-	if got, want := desktopUAFor(globalAuth()), "workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0"; got != want {
+	if got, want := desktopUAFor(globalAuth()), "workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
+	}
+	// RPC 层 UA 与 desktop 同形（首段即品牌 slug），chat 层则由 userAgent 覆盖。
+	if got, want := (&Client{}).rpcUAFor(globalAuth()), "workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0"; got != want {
+		t.Errorf("global rpc UA=%q want %q", got, want)
+	}
+	if got, want := (&Client{}).rpcUAFor(cn), "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"; got != want {
+		t.Errorf("CN rpc UA=%q want %q（CN 下与 chat 同值）", got, want)
 	}
 }
 

@@ -19,12 +19,19 @@ const (
 	// （UA 的 `<brand>/<ver>` 与白名单头组的 X-IDE-Version）。
 	//
 	// 取值来源：官方分发包 resources/install-manifest.json（appVersion）+ cli/product.json
-	// （genieVersion）—— 国内版 WorkBuddy **5.9.3**（endpoint www.workbuddy.cn）。
-	// 国际版仍按 5.8.4：本轮只对国内 5.9.3 做了真机抓包复核，国际分发包未重测，
-	// 不臆造新值（两版发版节奏不同，故**按 realm 分开**）。
+	// （genieVersion）。
+	//
+	//	国内版 WorkBuddy      5.9.3（endpoint www.workbuddy.cn，DefaultModelOptimizationOff=false）
+	//	国际版 WorkBuddy AI   5.9.4（endpoint www.workbuddy.ai，isOversea=true）
+	//
+	// 5.9.4 国际版取值证据（2026-10-30 拆包 + 真机抓包）：
+	//   - app.asar/package.json version / cli/product.json genieVersion = 5.9.4
+	//   - 真机 /v2/chat/completions UA = `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`
+	//   - 真机 X-IDE-Version: 5.9.4，/v3/config UA = `WorkBuddy/5.9.4 CLI/2.165.0`
+	//
 	// config upstream.client_version 可覆盖（空 = 按 realm 取内置默认）。
 	defaultClientVersionCN     = "5.9.3"
-	defaultClientVersionGlobal = "5.8.4"
+	defaultClientVersionGlobal = "5.9.4"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI **2.165.0**
 	// （cli/package.json 的 @genie/agent-cli version；5.9.3 真机 UA 实测同值）。
 	// config upstream.cli_version 可覆盖。
@@ -125,33 +132,54 @@ func (c *Client) defaultWorkBuddyUA() string {
 
 // v3ProbeUA /v3/config 目录探测的官方 UA（真机实测形态）。
 //
-// 2026-10-20 双版本抓包实测，两版对同一个 /v3/config 端点发的 UA 并不同：
+// 2026-10-30 双版本真机抓包（国际 5.9.4 / 国内 5.9.3）**两版同一形态**：
 //
-//	CN 5.8.3    → WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0   （三段，重复品牌）
-//	global 5.8.4 → WorkBuddy/5.8.4 CLI/2.161.0                    （两段，单品牌）
+//	CN 5.9.3     → WorkBuddy/5.9.3 CLI/2.165.0
+//	global 5.9.4 → WorkBuddy/5.9.4 CLI/2.165.0
 //
-// 旧实现在这里发 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 与
-// `CLI/2.63.2 CodeBuddy/2.63.2` 两套 CodeBuddy 家族 UA —— 那是从旧版 IDE
-// 客户端抄来的，WorkBuddy 分发包里根本不存在这两个串，属于最显眼的非官方指纹。
+// 都是两段、单品牌。旧实现在 CN 下发三段重复品牌（`WorkBuddy/<ver> WorkBuddy/<ver>
+// CLI/<cli>`），依据是 5.8.3 时代的抓包——那条结论在 5.9.3 上已不成立：同一账号
+// 同一 token 用三段 / 两段分别打 /v3/config，返回**逐字节相同**的 64866 字节
+// （61 个模型、agents=cli/16），UA 家族对该端点已不再区分模型集合。
+//
+// 历史反例（保留警示）：更早的 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 与
+// `CLI/2.63.2 CodeBuddy/2.63.2` 是从旧版 IDE 客户端抄的，WorkBuddy 分发包里
+// 根本不存在这两个串，属于最显眼的非官方指纹。
 func (c *Client) v3ProbeUA(a *auth.Auth) string {
-	ver := c.clientVersion(a)
-	if a != nil && a.IsGlobal() {
-		return "WorkBuddy/" + ver + " CLI/" + c.cliVersion()
-	}
-	return "WorkBuddy/" + ver + " " + uaBrandFor(a) + "/" + ver + " CLI/" + c.cliVersion()
+	return c.v3ProbeUALite(a)
 }
 
-// v3ProbeUALite /v3/config 第二路探测 UA：单品牌两段式。
+// v3ProbeUALite /v3/config 第二路探测 UA：单品牌两段式（= 真机唯一形态）。
 //
-// 保留双路探测是因为该端点按 UA 家族下发**不同模型集合**（实测 CN 19 / 32 / 54 条，
-// global 13 / 22 / 29 条，三族各有独有模型），只探一族会让 /v1/models 少模型。
-// 但两路都必须是官方真实出现过的形态——这里取 global 的 config UA 形态
-// （`WorkBuddy/<ver> CLI/<cli>`，与 v3ProbeUA 在 CN 下的三段式互补）。
-//
-// 注意：global 账号下本函数与 v3ProbeUA 返回同一串（真机 global 只发这一种形态），
-// 于是两路探测退化为重复请求——无害（并集去重），但不要据此认为 global 有第三族。
+// 保留双路探测只是为了让 global 的既有「取并集」调用链零改动（两路同串时并集
+// 退化为重复请求，无害）。**不要**据此认为存在「按 UA 分族的第三族模型」：
+// 2026-10-30 实测国内 5.9.3 两族返回完全相同，global 侧两路本来就同串。
 func (c *Client) v3ProbeUALite(a *auth.Auth) string {
 	return "WorkBuddy/" + c.clientVersion(a) + " CLI/" + c.cliVersion()
+}
+
+// rpcUAFor 桌面端 **RPC/REST 层**出站 UA（不是 chat 那条 SDK 链）。
+//
+// 2026-10-30 双版本真机抓包（同一台机器、同一会话）实测两族并存：
+//
+//	chat   → WorkBuddy/<ver> <brand>/<ver> CLI/<cli>   （SDK buildUserAgent，首段恒驼峰）
+//	RPC    → <brand>/<ver> <brand>/<ver> CLI/<cli>     （首段即品牌 slug）
+//
+// RPC 族覆盖 /v2/report、/v2/chat/busy、/console/as/*、/v2/plugin/auth/token/refresh、
+// /v2/as/scheduler/tasks、/v2/user-asset/*、/portal/*：
+//
+//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+//	global 5.9.4 → workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
+//
+// CN 下与 userAgent() 同值（品牌段本来就是驼峰），只有 global 会分叉——旧实现让
+// global 的 RPC 请求也发 `WorkBuddy/…` 首段，与真机不符。
+func (c *Client) rpcUAFor(a *auth.Auth) string {
+	if c != nil && c.UserAgent != "" {
+		return c.UserAgent
+	}
+	ver := c.clientVersion(a)
+	brand := uaBrandFor(a)
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + c.cliVersion()
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
@@ -235,16 +263,29 @@ func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
-	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
-	// chat 流式路径在 ChatHeaders 覆盖为 event-stream。
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// Accept：RPC/REST 层真机恒发宽松值 `application/json, text/plain, */*`
+	// （2026-10-30 双版本实测：/v2/report、/v2/chat/busy、/console/as/*、
+	// /v2/plugin/auth/token/refresh、/v2/user-asset/*、/portal/* 全部同值）。
+	// chat 那条链只发 `application/json`，由 ChatHeaders 收窄覆盖。
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	// X-Requested-With：**RPC/REST 层不发**。
+	//
+	// 2026-10-30 双版本全量扫描（1182 条 flow，125 条路径）按 UA 族切开后形态是干净的：
+	//
+	//	UA workbuddy-ai/…                         → 无 XRW（30/30）   ← RPC 层（node fetch）
+	//	UA WorkBuddy/<ver> WorkBuddy/<ver> CLI/…  → 无 XRW（26/26）   ← CN 的 RPC 层
+	//	UA WorkBuddy/<ver> <slug>/<ver> CLI/…     → 有 XRW（10/10）   ← 渲染器侧另一条链
+	//
+	// 即「带不带 XRW」由**哪条代码路径发的**决定，不是按 realm 切。本函数服务的是
+	// RPC 层（refresh / report / busy / console-as / user-asset / portal），
+	// 恒不带。chat 那条（SDK 链）**带**，由 ChatHeaders 自己补。
+	req.Header.Set("X-Product", "SaaS")
 	// Origin / Referer：**不发**。桌面端 RPC 层（refresh / v3-config / chat / busy /
 	// report）是 node fetch 调用，没有浏览器同源语义，5.9.3 真机这些路径一律不带这两个头
 	// （refresh idx 556、/v3/config idx 558 逐头确认）。旧实现在 CommonHeaders 里塞
 	// Origin+Referer，等于给每个 RPC 请求盖一个浏览器痕迹——反而不是客户端形态。
 	// 需要浏览器语义的调用方（登录页 / web 层）自行设置 originRefererFor。
-	req.Header.Set("User-Agent", c.userAgent(a))
+	req.Header.Set("User-Agent", c.rpcUAFor(a))
 	// X-CodeBuddy-Request：**只有 chat 带**（见 ChatHeaders）。5.9.3 真机全量扫描——
 	// 7 条 /v2/chat/completions 全带（`x-codebuddy-request: 1`），而 busy / report /
 	// refresh / v3-config / billing 等 30+ 条业务路径**一条都没有**。旧实现把它放在
@@ -402,6 +443,20 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// Accept-Encoding 刻意不设：官方发 br/gzip 全集，但显式设置会关闭 net/http 的
 	// 透明解压，收到 br 时网关没有 brotli 解码器 —— 收益（一个头）远小于风险。
 	req.Header.Set("Accept", "application/json")
+	// X-Requested-With：**chat 必带**（CommonHeaders 已不再设它，见那边的注释）。
+	// 2026-10-30 抓包：/v2/chat/completions 5/5 条全带 `x-requested-with: XMLHttpRequest`，
+	// 而 RPC 族（report / busy / console-as / refresh）一条都没有——chat 是唯一带的业务链。
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// User-Agent：chat 走 OpenAI SDK 的 buildUserAgent，首段**恒为驼峰 productName**
+	// `WorkBuddy/<ver>`，第二段才是品牌 slug——与 RPC/REST 层（首段即 slug，见
+	// rpcUAFor）不同。CommonHeaders 已按 RPC 形态设过，这里按 chat 形态覆盖。
+	//
+	//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+	//	global 5.9.4 → WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
+	//
+	// 2026-10-30 双版本真机 /v2/chat/completions 实测即上式（同一会话里 RPC 族
+	// 首段是 slug，两族并存本身就是官方形态）。
+	req.Header.Set("User-Agent", c.userAgent(a))
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
 	if at := a.AccessTokenValue(); at != "" {
@@ -412,12 +467,12 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 			req.Header.Set("X-API-Key", at)
 		}
 	} else {
-		req.Header.Set("X-No-Authorization", "1")
+		req.Header.Set("X-No-Authorization", "true")
 	}
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	} else {
-		req.Header.Set("X-No-User-Id", "1")
+		req.Header.Set("X-No-User-Id", "true")
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
 	// 企业/域头：**只发有值的**。桌面端个人号实测两个方向都不发 X-No-* 哨兵头
@@ -475,12 +530,32 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 
 // privateDataHeaderValue 出站 X-Private-Data 取值。
 //
-// 反编译：p[PRIVATE_DATA_HEADER] = resolveModelOptimizationEnabled(...) ? "false" : "true"，
-// 即「模型优化开着」= 允许数据用于改进 → false。企业版默认关优化（合规），个人号默认开。
-// 网关没有「用户手动关优化」这个开关可读，故按账号形态取：企业版 true，其余 false。
-// 这是本批修复里唯一仍带妥协的一项（个人号若在上游侧手动关了优化，网关发不出 true）。
+// 客户端逻辑（cli/dist 反编译 applyPrivateDataHeaderPolicy）：
+//
+//	A = resolveModelOptimizationEnabled({explicitEnabled, productDefaultEnabled, isEnterpriseEdition})
+//	p[PRIVATE_DATA_HEADER] = A ? "false" : "true"
+//	resolveModelOptimizationEnabled = (t,i,n) => typeof t=="boolean" ? t : !n && (i ?? true)
+//
+// 其中 productDefaultEnabled = !productFeatures.DefaultModelOptimizationOff，i.e.
+//
+//	真机值 = 企业版 || (发行版 DefaultModelOptimizationOff==true) ? "true" : "false"
+//
+// **判定维度是发行版，不是账号形态**——2026-10-30 双版本真机 + 拆包双向确认：
+//
+//	国际版 5.9.4  product.json DefaultModelOptimizationOff = true  → 个人号发 "true"（实测 4/4 条）
+//	国内版 5.9.3  product.json DefaultModelOptimizationOff = false → 个人号发 "false"（实测）
+//
+// 旧实现按「企业号 → true，其余 false」，把国际版个人号判成 false，方向正好相反
+// （每条 chat 都错）。网关没有「用户手动关优化」这个开关可读，故按 realm 取发行版默认。
 func privateDataHeaderValue(a *auth.Auth) string {
-	if a != nil && a.IsEnterprise() {
+	if a == nil {
+		return "false"
+	}
+	if a.IsEnterprise() {
+		return "true"
+	}
+	// 国际版（workbuddy.ai / codebuddy.ai）发行版默认关模型优化 → 声明 true。
+	if a.IsGlobal() {
 		return "true"
 	}
 	return "false"
@@ -670,14 +745,17 @@ func (c *Client) injectBaggage(req *http.Request, uid string, meta ChatMeta) {
 	if reqID == "" {
 		reqID = req.Header.Get("X-Conversation-Request-ID")
 	}
-	// 2026-10-28 补：真机 baggage 除两个 codebuddy.* 键外还承载 x-agent-runtime /
-	// x-agent-intent —— 客户端的 resolveAgentRuntime / resolveRequestScene 就是从
-	// baggage 里读这两项的（不是只读同名的两个请求头）。此前只发 4 个键，缺这两个
-	// 就等于告诉上游「这个 agent 运行时不知道自己是哪个运行时」。
+	// 2026-10-30 双版本真机复核（国际 5.9.4 4 条 + 国内 5.9.3 1 条 /v2/chat/completions
+	// 逐字比对）：baggage **只有 4 个成员**，两个 buddy 键留空值：
+	//
+	//	buddyId=,buddyName=,codebuddy.session_id=<conv>,codebuddy.conversation_request_id=<req>
+	//
+	// 此前按「客户端 resolveAgentRuntime / resolveRequestScene 从 baggage 读这两项」
+	// 推断了 x-agent-runtime / x-agent-intent 两个成员并注入——真机报文里没有，
+	// 多出的成员让 baggage 的序列化结构与客户端不一致（baggage 是 OTel 传播器
+	// 序列化的整体串，成员集合本身就是可比对的形态）。故删除，改回 4 键。
 	req.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conv+
-		",codebuddy.conversation_request_id="+reqID+
-		",x-agent-runtime="+req.Header.Get("X-Agent-Runtime")+
-		",x-agent-intent="+req.Header.Get("X-Agent-Intent"))
+		",codebuddy.conversation_request_id="+reqID)
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。

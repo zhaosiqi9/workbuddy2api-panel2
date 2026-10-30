@@ -52,14 +52,18 @@ func TestForRealm(t *testing.T) {
 	}
 }
 
-// TestEndpoints 覆盖三端点拼接：必须同域且 platform=CLI。Origin 与 API 同域是
-// 国际站的约束（跨域 Origin 会被上游按非法请求拒绝）；国内站是**已知例外**——
-// API 在 copilot.tencent.com、Origin 在 www.codebuddy.cn（与官方客户端一致）。
+// TestEndpoints 覆盖三端点拼接：必须同域且 platform 取站点自己的值。
+// Origin 与 API 同域是国际站的约束（跨域 Origin 会被上游按非法请求拒绝）；
+// 国内站是**已知例外**——API 在 copilot.tencent.com、Origin 在 www.codebuddy.cn
+// （与官方客户端一致）。
+//
+// platform 取值来自各分发包 product.json 的 authentication.attributes.platform：
+// CN=workbuddy（真机实测）、workbuddy.ai=workbuddy-ai（真机实测）、codebuddy.ai=CLI。
 func TestEndpoints(t *testing.T) {
 	for _, id := range []string{SiteCN, SiteIntl, SiteWorkBuddy} {
 		s := For(id)
 		state, token, account, origin := s.Endpoints()
-		if want := s.API + "/v2/plugin/auth/state?platform=CLI"; state != want {
+		if want := s.API + "/v2/plugin/auth/state?platform=" + s.Platform; state != want {
 			t.Errorf("%s state=%q want %q", id, state, want)
 		}
 		if want := s.API + "/v2/plugin/auth/token?state="; token != want {
@@ -122,11 +126,12 @@ func TestCodeSemantics(t *testing.T) {
 }
 
 // TestDecorateAuthURL 覆盖授权链接参数补齐（对齐官方 appendAuthUrlParams）：
-// 每个站点都补 version；ww_device_nonce 只对 platform=workbuddy 且 nonce 非空时补。
+// 每个站点都补 version；ww_device_nonce 只对 platform=workbuddy 的站点且 nonce
+// 非空时补——按官方口径，platform=workbuddy 的正是国内桌面端（CN 站）。
 func TestDecorateAuthURL(t *testing.T) {
 	const base = "https://example.com/login?platform=CLI&state=abc"
 
-	// 所有站点都补 version。
+	// 所有站点都补 version，原有参数（含 URL 自带的 platform）一律不动。
 	for _, id := range []string{SiteCN, SiteIntl, SiteWorkBuddy} {
 		got := DecorateAuthURL(base, For(id), "")
 		u, err := url.Parse(got)
@@ -141,21 +146,21 @@ func TestDecorateAuthURL(t *testing.T) {
 			t.Errorf("%s state=%q want abc（原有参数被破坏）", id, s)
 		}
 		if p := u.Query().Get("platform"); p != "CLI" {
-			t.Errorf("%s platform=%q want CLI", id, p)
+			t.Errorf("%s platform=%q want CLI（授权 URL 自带参数不得被改）", id, p)
 		}
 	}
 
-	// 只有 workbuddy 站带 nonce。
-	if got := DecorateAuthURL(base, For(SiteWorkBuddy), "nonce-1"); !containsParam(t, got, "ww_device_nonce", "nonce-1") {
-		t.Errorf("workbuddy 站未补 ww_device_nonce: %s", got)
+	// platform=workbuddy 的站点（= 国内桌面端）带 nonce。
+	if got := DecorateAuthURL(base, For(SiteCN), "nonce-1"); !containsParam(t, got, "ww_device_nonce", "nonce-1") {
+		t.Errorf("cn 站（platform=workbuddy）未补 ww_device_nonce: %s", got)
 	}
-	for _, id := range []string{SiteCN, SiteIntl} {
+	for _, id := range []string{SiteIntl, SiteWorkBuddy} {
 		if got := DecorateAuthURL(base, For(id), "nonce-1"); containsParam(t, got, "ww_device_nonce", "") {
 			t.Errorf("%s 站不该补 ww_device_nonce: %s", id, got)
 		}
 	}
-	// nonce 为空时 workbuddy 站也不补（不伪造设备指纹）。
-	if got := DecorateAuthURL(base, For(SiteWorkBuddy), ""); containsParam(t, got, "ww_device_nonce", "") {
+	// nonce 为空时一律不补（不伪造设备指纹）。
+	if got := DecorateAuthURL(base, For(SiteCN), ""); containsParam(t, got, "ww_device_nonce", "") {
 		t.Errorf("nonce 为空时不该补 ww_device_nonce: %s", got)
 	}
 
@@ -229,5 +234,100 @@ func TestClientUA(t *testing.T) {
 	want := "CLI/" + ClientVersion + " CodeBuddy/" + ClientVersion
 	if ClientUA != want {
 		t.Errorf("ClientUA=%q want %q", ClientUA, want)
+	}
+}
+
+// TestEndpointHeaders 设备码三端点的出站头族必须与真机一致：
+// 桌面端 RPC 族 UA、宽松 Accept、X-Product，且**不含**浏览器痕迹。
+//
+// 2026-10-30 双版本抓包：auth/state、auth/token、login/account 三条由桌面端
+// node fetch 发出，逐条确认无 Origin / Referer / X-Requested-With；
+// UA 是 WorkBuddy 桌面端 RPC 族，不是 `CLI/<ver> CodeBuddy/<ver>`。
+//
+// 三条端点的差异（x-domain / x-no-* / x-device-token / Bearer）见下面各自的子测试。
+func TestEndpointHeaders(t *testing.T) {
+	wantGLUA := "workbuddy-ai/" + ClientVersionWorkBuddyGL + " workbuddy-ai/" + ClientVersionWorkBuddyGL + " CLI/" + ClientVersionBuiltinCLI
+	wantCNUA := "WorkBuddy/" + ClientVersionWorkBuddyCN + " WorkBuddy/" + ClientVersionWorkBuddyCN + " CLI/" + ClientVersionBuiltinCLI
+
+	cases := []struct {
+		site   Site
+		wantUA string
+	}{
+		{For(SiteCN), wantCNUA},
+		{For(SiteIntl), wantGLUA},
+		{For(SiteWorkBuddy), wantGLUA},
+	}
+	for _, c := range cases {
+		h := c.site.EndpointHeaders()
+		if got := h["User-Agent"]; got != c.wantUA {
+			t.Errorf("%s User-Agent=%q want %q", c.site.ID, got, c.wantUA)
+		}
+		if got := h["X-Product"]; got != "SaaS" {
+			t.Errorf("%s X-Product=%q want SaaS", c.site.ID, got)
+		}
+		if got := h["Accept"]; got != "application/json, text/plain, */*" {
+			t.Errorf("%s Accept=%q want 宽松值", c.site.ID, got)
+		}
+		if got := h["X-Request-ID"]; len(got) != 32 {
+			t.Errorf("%s X-Request-ID=%q want 32 hex", c.site.ID, got)
+		}
+		for _, k := range []string{"Origin", "Referer", "X-Requested-With"} {
+			if v, ok := h[k]; ok {
+				t.Errorf("%s 不应出现 %s=%q（真机 node fetch 无此头）", c.site.ID, k, v)
+			}
+		}
+	}
+}
+
+// TestLoginEndpointHeaderVariants 三条端点的差异头（真机逐条核对）。
+//
+//	auth/state       x-domain + 4 个 x-no-* + x-custom-channel-id + x-device-token
+//	auth/token       4 个 x-no-*（**唯一没有 x-domain 的端点**）
+//	login/account    x-domain + Bearer + 3 个 x-no-*（无 x-no-authorization）
+func TestLoginEndpointHeaderVariants(t *testing.T) {
+	s := For(SiteCN)
+
+	st := s.HeadersForState("v3:abc")
+	for _, k := range []string{"X-Domain", "X-No-Authorization", "X-No-User-Id",
+		"X-No-Enterprise-Id", "X-No-Department-Info", "X-Custom-Channel-Id", "X-Device-Token"} {
+		if st[k] == "" {
+			t.Errorf("auth/state 缺 %s", k)
+		}
+	}
+	if got := st["X-Domain"]; got != "www.workbuddy.cn" {
+		t.Errorf("auth/state X-Domain=%q want www.workbuddy.cn（前端主机名，非 API base）", got)
+	}
+	// 设备 token 取不到时**不发**该头（不伪造）。
+	if got := s.HeadersForState("")["X-Device-Token"]; got != "" {
+		t.Errorf("无设备 token 时不应发 X-Device-Token，实际 %q", got)
+	}
+
+	tk := s.HeadersForToken()
+	if got := tk["X-Domain"]; got != "" {
+		t.Errorf("auth/token 真机无 X-Domain，实际 %q", got)
+	}
+	for _, k := range []string{"X-No-Authorization", "X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
+		if tk[k] != "true" {
+			t.Errorf("auth/token %s=%q want true", k, tk[k])
+		}
+	}
+	if tk["X-Device-Token"] != "" || tk["X-Custom-Channel-Id"] != "" {
+		t.Errorf("auth/token 不应带设备头: %v", tk)
+	}
+
+	ac := s.HeadersForAccount("AT")
+	if got := ac["Authorization"]; got != "Bearer AT" {
+		t.Errorf("login/account Authorization=%q want Bearer AT", got)
+	}
+	if got := ac["X-Domain"]; got != "www.workbuddy.cn" {
+		t.Errorf("login/account X-Domain=%q want www.workbuddy.cn", got)
+	}
+	if ac["X-No-Authorization"] != "" {
+		t.Errorf("login/account 已带 Bearer，不应发 X-No-Authorization")
+	}
+	for _, k := range []string{"X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
+		if ac[k] != "true" {
+			t.Errorf("login/account %s=%q want true", k, ac[k])
+		}
 	}
 }

@@ -74,16 +74,18 @@ var cnGoldenCases = []cnGolden{
 		path: "/v2/report",
 		headers: []string{
 			"accept", "authorization", "content-type", "user-agent", "x-domain",
-			"x-product", "x-request-id", "x-requested-with", "x-user-id",
+			"x-product", "x-request-id", "x-user-id",
 		},
 		values: map[string]string{
-			"accept":           "application/json, text/plain, */*",
-			"content-type":     "application/json;charset=UTF-8",
-			"x-requested-with": "XMLHttpRequest",
-			"x-product":        "SaaS",
-			"user-agent":       "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
+			"accept":       "application/json, text/plain, */*",
+			"content-type": "application/json;charset=UTF-8",
+			"x-product":    "SaaS",
+			"user-agent":   "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
 		},
-		absent: []string{"origin", "referer", "accept-language", "x-codebuddy-request", "x-device-token"},
+		// 2026-10-30 复核：CN 5.9.3 全部 26 条 /v2/report（含登录前 2 条）**都没有**
+		// X-Requested-With。国际版那 10 条带它的样本属于 UA 首段驼峰的渲染器侧另一族，
+		// 与本函数发的三段式不是同一个上报通道。
+		absent: []string{"origin", "referer", "accept-language", "x-codebuddy-request", "x-device-token", "x-requested-with"},
 	},
 	{
 		// 真机 idx 307/531/380…（19 条）：轻头族，不是 chat 重头族。
@@ -105,12 +107,14 @@ var cnGoldenCases = []cnGolden{
 		},
 	},
 	{
-		// 真机 idx 556。
+		// 真机 idx 556。XRW：refresh 的 RPC 族样本（本函数发的这一族）**无**此头，
+		// 只有渲染器族 `WorkBuddy/<ver> <slug>/<ver> CLI/…` 那条镜像请求才带
+		// （2026-10-30 三条 refresh 逐条核对：RPC 两条无、渲染器一条有）。
 		path: "/v2/plugin/auth/token/refresh",
 		headers: []string{
 			"accept", "authorization", "content-type", "user-agent",
 			"x-auth-refresh-source", "x-domain", "x-product", "x-refresh-token",
-			"x-request-id", "x-requested-with", "x-user-id",
+			"x-request-id", "x-user-id",
 		},
 		values: map[string]string{
 			"accept":                "application/json, text/plain, */*",
@@ -118,7 +122,7 @@ var cnGoldenCases = []cnGolden{
 			"x-product":             "SaaS",
 			"user-agent":            "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
 		},
-		absent: []string{"origin", "referer", "accept-language", "x-codebuddy-request"},
+		absent: []string{"origin", "referer", "accept-language", "x-codebuddy-request", "x-requested-with"},
 	},
 	{
 		// 真机 idx 314（23 条 billing 同构）。
@@ -136,18 +140,21 @@ var cnGoldenCases = []cnGolden{
 	},
 	{
 		// 真机 idx 558（9 条 /v3/config 同构）。
+		// XRW：该路径由 RPC 层打，主流样本（CLI 两段式 UA）**无**此头；带 XRW 的那几条
+		// 是渲染器族的镜像请求（UA 为三段 `WorkBuddy/<ver> <slug>/<ver> CLI/…`），
+		// 不是本函数这条链。
 		path: "/v3/config",
 		headers: []string{
 			"accept", "authorization", "user-agent", "x-domain", "x-product",
-			"x-request-id", "x-requested-with", "x-user-id",
+			"x-request-id", "x-user-id",
 		},
 		values: map[string]string{
-			"accept":           "application/json, text/plain, */*",
-			"x-requested-with": "XMLHttpRequest",
-			"x-product":        "SaaS",
-			"user-agent":       "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
+			"accept":    "application/json, text/plain, */*",
+			"x-product": "SaaS",
+			// 2026-10-30 复核：真机 /v3/config 是两段单品牌（同 token 三段/两段返回相同）。
+			"user-agent": "WorkBuddy/5.9.3 CLI/2.165.0",
 		},
-		absent: []string{"origin", "referer", "accept-language", "x-codebuddy-request"},
+		absent: []string{"origin", "referer", "accept-language", "x-codebuddy-request", "x-requested-with"},
 	},
 }
 

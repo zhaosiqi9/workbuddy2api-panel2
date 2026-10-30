@@ -165,7 +165,10 @@ func TestAgentTypePerScene(t *testing.T) {
 	}
 }
 
-// TestPrivateDataTrueBranch 企业号发 X-Private-Data: true（企业版默认关模型优化）。
+// TestPrivateDataTrueBranch X-Private-Data 按**发行版**取，不是按账号形态：
+// 企业号恒 true；个人号看 realm（国际版默认关模型优化 → true；国内版 → false）。
+// 依据：productFeatures.DefaultModelOptimizationOff（GL 5.9.4=true / CN 5.9.3=false）
+// + 2026-10-30 双版本真机 chat 逐条比对。
 func TestPrivateDataTrueBranch(t *testing.T) {
 	c := &Client{}
 	ent := &auth.Auth{UID: "u1", EnterpriseID: "ent-1", AccessToken: "at"}
@@ -174,28 +177,45 @@ func TestPrivateDataTrueBranch(t *testing.T) {
 	if got := req.Header.Get("X-Private-Data"); got != "true" {
 		t.Errorf("企业号 X-Private-Data=%q want true", got)
 	}
+	// 国内个人号：发行版默认开模型优化 → false。
 	personal := httptest.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", nil)
 	c.ChatHeaders(personal, &auth.Auth{UID: "u2", AccessToken: "at"}, "", ChatMeta{ConversationID: "c1"})
 	if got := personal.Header.Get("X-Private-Data"); got != "false" {
-		t.Errorf("个人号 X-Private-Data=%q want false", got)
+		t.Errorf("国内个人号 X-Private-Data=%q want false", got)
+	}
+	// 国际个人号：发行版默认**关**模型优化 → true（真机 4/4 条实测）。
+	gl := &auth.Auth{UID: "u3", AccessToken: "at", Domain: "workbuddy.ai"}
+	glReq := httptest.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", nil)
+	c.ChatHeaders(glReq, gl, "", ChatMeta{ConversationID: "c1"})
+	if got := glReq.Header.Get("X-Private-Data"); got != "true" {
+		t.Errorf("国际个人号 X-Private-Data=%q want true", got)
 	}
 }
 
-// TestBaggageCarriesRuntimeKeys baggage 必须承载 x-agent-runtime / x-agent-intent
-// （客户端 resolveAgentRuntime / resolveRequestScene 从 baggage 读这两项）。
-func TestBaggageCarriesRuntimeKeys(t *testing.T) {
+// TestBaggageHasOnlyFourMembers baggage 必须**恰好** 4 个成员：
+// buddyId / buddyName / codebuddy.session_id / codebuddy.conversation_request_id。
+// 曾注入 x-agent-runtime / x-agent-intent 两个成员，真机报文里没有（成员集合本身
+// 就是可比对的形态）。
+func TestBaggageHasOnlyFourMembers(t *testing.T) {
 	c := &Client{}
 	req := httptest.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", nil)
 	c.ChatHeaders(req, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{ConversationID: "c1", ConversationRequestID: "r1"})
 	bg := req.Header.Get("baggage")
 	for _, want := range []string{
 		"codebuddy.session_id=c1", "codebuddy.conversation_request_id=r1",
-		"x-agent-runtime=" + req.Header.Get("X-Agent-Runtime"),
-		"x-agent-intent=" + req.Header.Get("X-Agent-Intent"),
+		"buddyId=", "buddyName=",
 	} {
 		if !strings.Contains(bg, want) {
 			t.Errorf("baggage 缺 %q: %s", want, bg)
 		}
+	}
+	for _, banned := range []string{"x-agent-runtime", "x-agent-intent"} {
+		if strings.Contains(bg, banned) {
+			t.Errorf("baggage 不得含 %q（真机只有 4 键）: %s", banned, bg)
+		}
+	}
+	if n := len(strings.Split(bg, ",")); n != 4 {
+		t.Errorf("baggage 成员数=%d want 4: %s", n, bg)
 	}
 	// 与同名头同值（头体一致的硬要求）。
 	if req.Header.Get("X-Agent-Runtime") == "" || req.Header.Get("X-Agent-Intent") == "" {

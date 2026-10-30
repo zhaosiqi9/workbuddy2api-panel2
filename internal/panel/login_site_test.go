@@ -82,8 +82,8 @@ func TestLoginStartRecordsSiteAndDecoratesURL(t *testing.T) {
 	if v := u.Query().Get("version"); v != loginsite.ClientVersion {
 		t.Errorf("授权链接缺 version（或值不符）：%q", rawURL)
 	}
-	if gotPlatform != "CLI" {
-		t.Errorf("platform=%q want CLI", gotPlatform)
+	if gotPlatform != "workbuddy-ai" {
+		t.Errorf("platform=%q want workbuddy-ai（intl 站点真机口径）", gotPlatform)
 	}
 
 	// 会话必须记住站点，否则 poll 会按 cn 端点去问，永远拿不到 token。

@@ -2,7 +2,7 @@
 //
 // 两个子命令，由 login.sh 顺序驱动：
 //
-//	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
+//	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=<站点 Platform> 拿 state+authUrl，
 //	                                  state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
 //	login [--realm=cn|global] poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
 //	                                  成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
@@ -36,11 +36,10 @@ import (
 )
 
 // 上游常量：站点表与 UA 统一来自 internal/loginsite（官方口径唯一来源）。
-// CN → copilot.tencent.com（Origin www.codebuddy.cn）；国际站两套主机名并存：
+// CN → copilot.tencent.com；国际站两套主机名并存：
 // intl → www.codebuddy.ai（官方 CLI externalDomain）、workbuddy → www.workbuddy.ai
-// （旧桌面端）。base 与 Origin/Referer 恒同域。
-const clientUA = loginsite.ClientUA
-
+// （旧桌面端）。UA 按站点取（loginsite.Site.UserAgent），不再有全局 CLI 串。
+//
 // 登录 state 落盘路径（var 便于测试替换临时文件）
 // Portable across OSes: the upstream hardcoded "/tmp/...", which on
 // Windows resolves to <drive>:	mp\... and aborts the OAuth flow with
@@ -58,16 +57,35 @@ func realmConfig(realm string) (base, origin string) {
 	return s.API, s.Origin
 }
 
-// commonHeaders 按 origin 设置通用请求头（Origin/Referer 随站点变化）。
-// 返回 func(*http.Request)，由调用方按站点选定的 origin 构造一次后复用。
-func commonHeaders(origin string) func(*http.Request) {
+// commonHeaders 设备码端点的公共头族，直接取站点定义的真机头族
+// （loginsite.Site.EndpointHeaders）。返回 func(*http.Request)，由调用方按站点
+// 构造一次后复用。
+//
+// 不再发 Origin / Referer / X-Requested-With：2026-10-30 双版本真机抓包显示这三条
+// 端点由桌面端 node fetch 发出，恒无这三个头；浏览器的同源语义只属于「打开授权页」
+// 那一步，不属于 API 调用。UA 也换成桌面端 RPC 族，不再是 CodeBuddy CLI 家族串。
+//
+// 端点差异头（x-device-token / x-no-* / Bearer）由 withExtra 叠加。
+func commonHeaders(site loginsite.Site) func(*http.Request) {
+	hdrs := site.EndpointHeaders()
 	return func(req *http.Request) {
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		req.Header.Set("X-Requested-With", "XMLHttpRequest")
-		req.Header.Set("Origin", origin)
-		req.Header.Set("Referer", origin+"/")
-		req.Header.Set("User-Agent", clientUA)
+		for k, v := range hdrs {
+			if v != "" {
+				req.Header.Set(k, v)
+			}
+		}
+	}
+}
+
+// withExtra 在基础头函数之上叠加端点差异头（空值跳过）。
+func withExtra(base func(*http.Request), extra map[string]string) func(*http.Request) {
+	return func(req *http.Request) {
+		base(req)
+		for k, v := range extra {
+			if v != "" {
+				req.Header.Set(k, v)
+			}
+		}
 	}
 }
 
@@ -99,8 +117,8 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	if headers != nil {
 		headers(req)
 	} else {
-		// 缺省头：国内站 origin（与原 commonHeaders() 行为一致，零回归）
-		commonHeaders(loginsite.For("").Origin)(req)
+		// 缺省头：国内站（与原 commonHeaders() 行为一致，零回归）
+		commonHeaders(loginsite.For(""))(req)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -257,8 +275,10 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // （带 realm+site），stdout 打印 authURL（已按官方补齐 version / ww_device_nonce）。
 // out 接 stdout；statePath 为落盘路径（可注入临时文件便于测试）。
 func runURL(site loginsite.Site, statePath string, client *http.Client, out io.Writer) {
-	headers := commonHeaders(site.Origin)
-	data, _, err := doJSON(client, http.MethodPost, site.API+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
+	stateURL, _, _, _ := site.Endpoints()
+	// auth/state 真机带 x-device-token（取到才发）+ x-custom-channel-id + 四个 x-no-*。
+	headers := withExtra(commonHeaders(site), site.HeadersForState(loginDeviceToken()))
+	data, _, err := doJSON(client, http.MethodPost, stateURL, headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		fatal("auth state failed: %v", err)
 	}
@@ -280,6 +300,23 @@ func runURL(site loginsite.Site, statePath string, client *http.Client, out io.W
 // SDK，取部署侧环境变量；空 = 不加该参数（不伪造设备指纹）。
 func loginDeviceNonce() string {
 	return strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_NONCE"))
+}
+
+// loginDeviceToken 设备风控 token（X-Device-Token，auth/state 出站头）。
+//
+// 真机为 `v3:<base64…>`，由桌面端 qimei 组件本地生成，无法从 machineId 推导。
+// 取不到就返回空串（调用方据此不发该头）——伪造比缺失更容易被判成非客户端。
+// 来源：CODEBUDDY_LOGIN_DEVICE_TOKEN 环境变量，或 CODEBUDDY_LOGIN_DEVICE_TOKEN_FILE。
+func loginDeviceToken() string {
+	if v := strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_TOKEN")); v != "" {
+		return v
+	}
+	if p := strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_TOKEN_FILE")); p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
 }
 
 // runPoll 执行 poll 子命令：读 state 文件（realm/site 校验），向站点 token 端点
@@ -304,10 +341,11 @@ func runPoll(site loginsite.Site, statePath string, client *http.Client, out io.
 	if ls.Site != "" && ls.Site != site.ID {
 		fatal("site mismatch: state file site=%q, command site=%q（url 与 poll 需同一站点）", ls.Site, site.ID)
 	}
-	headers := commonHeaders(site.Origin)
+	// auth/token 真机是唯一不带 x-domain 的端点（只有公共头 + 四个 x-no-*）。
+	tokenH := withExtra(commonHeaders(site), site.HeadersForToken())
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 	// pending 时业务码 11217，完成时 code=0 + token bundle
-	tokRaw, status, errTok := doJSON(client, http.MethodGet, site.API+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
+	tokRaw, status, errTok := doJSON(client, http.MethodGet, site.API+"/v2/plugin/auth/token?state="+ls.State, tokenH, nil)
 	if errTok != nil {
 		var envErr *envelopeError
 		if errors.As(errTok, &envErr) {
@@ -342,10 +380,8 @@ func runPoll(site loginsite.Site, statePath string, client *http.Client, out io.
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	}
-	acctHeaders := func(r *http.Request) {
-		headers(r)
-		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-	}
+	// login/account 真机带 x-domain + Bearer + 三个 x-no-*（无 x-no-authorization）。
+	acctHeaders := withExtra(commonHeaders(site), site.HeadersForAccount(tok.AccessToken))
 	acctRaw, _, errAcct := doJSON(client, http.MethodGet, site.API+"/v2/plugin/login/account?state="+ls.State, acctHeaders, nil)
 	if errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)

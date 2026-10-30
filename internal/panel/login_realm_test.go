@@ -9,16 +9,20 @@ import (
 
 // TestLoginEndpoints realm→端点映射：global 保持历史语义（workbuddy.ai），
 // cn/空/非法值 → copilot.tencent.com（零回归兜底）。
+//
+// platform 取各站点的官方口径（product.json 的 authentication.attributes.platform，
+// 2026-10-30 真机实测）：global(workbuddy.ai)=workbuddy-ai、cn=workbuddy。
+// 旧期望是硬编码的 CLI —— 那是 product.json 的**顶层** platform 字段，不是授权用的那个。
 func TestLoginEndpoints(t *testing.T) {
 	cases := []struct {
 		realm      string
 		wantState  string
 		wantOrigin string
 	}{
-		{"global", "https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI", "https://www.workbuddy.ai"},
-		{"cn", "https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI", "https://www.codebuddy.cn"},
-		{"", "https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI", "https://www.codebuddy.cn"},
-		{"weird", "https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI", "https://www.codebuddy.cn"},
+		{"global", "https://www.workbuddy.ai/v2/plugin/auth/state?platform=workbuddy-ai", "https://www.workbuddy.ai"},
+		{"cn", "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
+		{"", "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
+		{"weird", "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
 	}
 	for _, c := range cases {
 		t.Run(c.realm, func(t *testing.T) {
@@ -115,11 +119,21 @@ func TestLoginEnvelopeErrorAs(t *testing.T) {
 }
 
 // TestClientUAOfficial 覆盖 UA 与官方 CLI 版本同源（升级版本号时 UA/version 不能漂移）。
+//
+// 注意：设备码三端点已改为按站点取桌面端 RPC 族 UA（Site.UserAgent），
+// clientUA 只剩「未复核站点兜底」这一条用途；此处钉住它仍与 ClientVersion 同源。
 func TestClientUAOfficial(t *testing.T) {
 	if clientUA != loginsite.ClientUA {
 		t.Errorf("面板 UA=%q 与 loginsite.ClientUA=%q 不一致", clientUA, loginsite.ClientUA)
 	}
 	if loginsite.ClientVersion != "2.176.0" {
 		t.Errorf("官方 CLI 版本变了（%s），请同步核对登录页参数与码表", loginsite.ClientVersion)
+	}
+	// 真机复核过的两个站点必须发桌面端 RPC 族 UA，不能落回 CodeBuddy CLI 串。
+	for _, id := range []string{loginsite.SiteCN, loginsite.SiteWorkBuddy} {
+		ua := loginsite.For(id).EndpointHeaders()["User-Agent"]
+		if ua == loginsite.ClientUA {
+			t.Errorf("站点 %s 的 UA 回落成了 CodeBuddy CLI 串 %q", id, ua)
+		}
 	}
 }

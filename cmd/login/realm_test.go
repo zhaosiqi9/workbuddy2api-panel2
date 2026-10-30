@@ -111,8 +111,8 @@ func TestRunURLDecoratesAuthURL(t *testing.T) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/state") {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
-		if got := r.URL.Query().Get("platform"); got != "CLI" {
-			t.Errorf("platform=%q want CLI", got)
+		if got := r.URL.Query().Get("platform"); got != "workbuddy-ai" {
+			t.Errorf("platform=%q want workbuddy-ai（intl 站点真机口径）", got)
 		}
 		// 授权 URL 用测试服务器自身地址，便于断言参数。
 		base := "http://" + r.Host

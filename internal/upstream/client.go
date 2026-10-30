@@ -2365,7 +2365,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		return nil, nil, err
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// X-Requested-With：**不发**。/v3/config 由 RPC 层（node fetch）打，2026-10-30 双版本
+	// 抓包里该路径主流样本（CLI UA 族）恒无此头；只有渲染器侧另一条链的镜像请求带，
+	// 那是另一族形态，不是我们必须对齐的那条。
 	// AccessToken 加锁快照（同 fetchEnterpriseModels）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	if a != nil && a.UID != "" {

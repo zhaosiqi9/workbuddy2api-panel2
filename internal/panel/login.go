@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	// clientUA 设备授权链路 UA（与授权链接 version 参数同源，官方口径集中在
-	// internal/loginsite，避免面板与 cmd/login 各写一份）。
+	// clientUA 保留仅为兼容既有测试引用；设备码端点实际 UA 按站点取
+	// （loginsite.Site.UserAgent → EndpointHeaders），登录链路已不再发 CodeBuddy CLI 串。
 	clientUA = loginsite.ClientUA
 )
 
@@ -93,13 +93,40 @@ func (e *loginEnvelopeError) Error() string {
 // loginHTTP 设备授权专用 client：短超时、无 cookie（每请求携带 state，无会话态）。
 var loginHTTP = &http.Client{Timeout: 30 * time.Second}
 
-func commonHeaders(req *http.Request, origin string) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", clientUA)
+// commonHeaders 设备码端点的公共头族（真机形态，见 loginsite.Site.EndpointHeaders）。
+//
+// 不再发 Origin / Referer / X-Requested-With：2026-10-30 双版本真机抓包显示这三条
+// 端点（auth/state、auth/token、login/account）由桌面端 node fetch 发出，恒无这三个头
+// ——浏览器同源语义只出现在「打开授权页」那一步，不在 API 调用上。
+//
+// 三端点的**差异头**（x-domain / x-no-* / x-device-token / Authorization）由
+// stateHeaders / tokenHeaders / accountHeaders 三个包装补，不要在这里抹平。
+func commonHeaders(req *http.Request, site loginSite) {
+	applyHeaders(req, site.EndpointHeaders())
+}
+
+// applyHeaders 把 map 头批量写到 req（空值跳过，避免发出空头）。
+func applyHeaders(req *http.Request, h map[string]string) {
+	for k, v := range h {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
+	}
+}
+
+// stateHeaders POST /v2/plugin/auth/state 的头族（含 x-device-token 与哨兵）。
+func stateHeaders(site loginSite, deviceToken string) map[string]string {
+	return site.HeadersForState(deviceToken)
+}
+
+// tokenHeaders GET /v2/plugin/auth/token 的头族（真机唯一不带 x-domain 的端点）。
+func tokenHeaders(site loginSite) map[string]string {
+	return site.HeadersForToken()
+}
+
+// accountHeaders GET /v2/plugin/login/account 的头族（带 Bearer，x-no-authorization 缺席）。
+func accountHeaders(site loginSite, accessToken string) map[string]string {
+	return site.HeadersForAccount(accessToken)
 }
 
 // validUID 校验上游返回的 uid 是否可安全用于拼文件名。
@@ -126,16 +153,16 @@ type apiEnvelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
-// doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
-func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
+// doJSON 发一次 JSON 请求并解信封。site 决定头族与 UA（真机形态，见 commonHeaders）；
+// extra 为端点差异头（state 的 x-device-token / 哨兵、account 的 Bearer 等），
+// 在公共头之后覆盖写入，nil 表示只发公共头。
+func doJSON(method, fullURL string, extra map[string]string, body io.Reader, site loginSite) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
 		return nil, 0, err
 	}
-	commonHeaders(req, origin)
-	if bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+bearer)
-	}
+	commonHeaders(req, site)
+	applyHeaders(req, extra)
 	resp, err := loginHTTP.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -162,6 +189,28 @@ func loginDeviceNonce() string {
 	return strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_NONCE"))
 }
 
+// loginDeviceToken 设备风控 token（X-Device-Token），用于 auth/state 的出站头。
+//
+// 真机（CN 5.9.3 / GL 5.9.4）该头恒为 `v3:<base64…>` 形态，由客户端 qimei 组件
+// 本地生成后加密上报，**不是**能从 machineId 推导出来的东西。网关拿不到就返回空串，
+// 调用方据此不发该头——伪造一个假 token 比缺这个头更容易被判定为非客户端。
+//
+// 取值来源（按优先级）：
+//
+//	CODEBUDDY_LOGIN_DEVICE_TOKEN 环境变量
+//	CODEBUDDY_LOGIN_DEVICE_TOKEN_FILE 指向的文件（宿主从桌面端落盘处导出）
+func loginDeviceToken() string {
+	if v := strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_TOKEN")); v != "" {
+		return v
+	}
+	if p := strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_TOKEN_FILE")); p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
+}
+
 // loginStart 发起设备授权：POST auth/state 拿授权 URL。
 // body 可带 {"site":"cn"|"intl"|"workbuddy"}（官方域表，缺省 cn）；
 // 兼容老前端 {"realm":"global"} → 旧桌面端 workbuddy.ai（零回归）。
@@ -182,8 +231,9 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	epState, _, _, origin := loginEndpointsFor(site)
-	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
+	epState, _, _, _ := loginEndpointsFor(site)
+	// auth/state：真机带 x-device-token（取到才发）+ x-custom-channel-id + 四个 x-no-*。
+	data, status, err := doJSON(http.MethodPost, epState, stateHeaders(site, loginDeviceToken()), bytes.NewReader([]byte("{}")), site)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
@@ -265,13 +315,14 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		}
 		p.loginMu.Unlock()
 	}()
-	_, epToken, epAcct, origin := loginEndpointsFor(siteOrDefault(sess.site))
+	pollSite := siteOrDefault(sess.site)
+	_, epToken, epAcct, _ := loginEndpointsFor(pollSite)
 
 	// auth/token 是权威登录状态端点。官方码表语义：
 	//   11217（RetryFetchToken）→ 还没登完，继续轮询；
 	//   12005/11212/11216（席位满/许可证过期/试用到期）→ 终态，立刻把上游 msg
 	//   抛给前端并停轮询（官方 SignLicenseError 行为），不再空转到 TTL。
-	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
+	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, tokenHeaders(pollSite), nil, pollSite)
 	if err != nil {
 		var envErr *loginEnvelopeError
 		if errors.As(err, &envErr) && loginCodeFatal(envErr.Code) {
@@ -311,7 +362,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	}
-	acctRaw, _, errAcct := doJSON(http.MethodGet, epAcct+state, tok.AccessToken, nil, origin)
+	acctRaw, _, errAcct := doJSON(http.MethodGet, epAcct+state, accountHeaders(pollSite, tok.AccessToken), nil, pollSite)
 	if errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	} else {

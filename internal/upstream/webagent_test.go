@@ -124,14 +124,14 @@ func TestCreateWebConversationUsesWebIdentity(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.ua) == 0 || !strings.HasPrefix(f.ua[0], "Mozilla/5.0") {
-		t.Errorf("UA=%q want 浏览器 UA（网页通道不是桌面指纹）", f.ua)
+	if len(f.ua) == 0 || !strings.HasPrefix(f.ua[0], "WorkBuddy/") {
+		t.Errorf("UA=%q want 桌面端 RPC UA（真机 console/as 不是浏览器身份）", f.ua)
 	}
-	if f.origin[0] != f.srv.URL {
-		t.Errorf("Origin=%q want %q", f.origin[0], f.srv.URL)
+	if f.origin[0] != "" {
+		t.Errorf("Origin=%q want 空（真机 242 条 console/as 请求无一携带）", f.origin[0])
 	}
-	if f.referer[0] != f.srv.URL+"/app" {
-		t.Errorf("Referer=%q want %q", f.referer[0], f.srv.URL+"/app")
+	if f.referer[0] != "" {
+		t.Errorf("Referer=%q want 空（同上）", f.referer[0])
 	}
 	var body map[string]any
 	if err := json.Unmarshal([]byte(f.bodies[0]), &body); err != nil {

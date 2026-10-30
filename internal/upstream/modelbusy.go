@@ -60,19 +60,25 @@ func (c *Client) ModelBusy(a *auth.Auth, models []string) (map[string]string, er
 		if err != nil {
 			return out, err
 		}
-		// 头族按 5.9.3 真机 /v2/chat/busy 逐头对齐——**不是** chat 那套重头族：
+		// 头族按真机 /v2/chat/busy 逐头对齐——**不是** chat 那套重头族：
 		//
 		//	Accept: application/json, text/plain, */*
 		//	Content-Type: application/json
-		//	User-Agent: WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+		//	User-Agent: <RPC 族>   CN  WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+		//	                      GL  workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
 		//	X-Request-ID / X-Product: SaaS / Authorization / X-User-Id / X-Domain
 		//
 		// 真机这条路径**不发** X-Conversation-* / acp-connection-id / baggage / b3 /
 		// x-stainless-* / x-codebuddy-request，也没有 X-Requested-With。旧实现直接复用
 		// ChatHeaders，等于给一个官方轻请求套上 20 多个它从不发的头。
+		//
+		// UA 取 rpcUAFor（首段即品牌 slug），不是 userAgent（chat 的 SDK 形态）：
+		// 2026-10-30 国际版 5.9.4 真机 /v2/chat/busy = `workbuddy-ai/5.9.4 workbuddy-ai/
+		// 5.9.4 CLI/2.165.0`，而同一会话的 /v2/chat/completions 首段是驼峰 WorkBuddy。
+		// CN 下两者同值（品牌段本来就是驼峰），故只有 GL 会分叉。
 		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", c.userAgent(a))
+		req.Header.Set("User-Agent", c.rpcUAFor(a))
 		req.Header.Set("X-Request-ID", session.NewTraceID()) // 真机为纯随机 32 hex（无时间前缀）
 		req.Header.Set("X-Product", "SaaS")
 		if at := a.AccessTokenValue(); at != "" {
