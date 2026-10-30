@@ -36,7 +36,7 @@ type LogEntry struct {
 
 // taskPrefixes 任务动作日志的行首标识（scheduler 与 panel 的既有口径）。
 var taskPrefixes = []string{
-	"streak-bonus ", "travel ", "blackcat ", "lottery ",
+	"streak-bonus ", "travel ", "lottery ",
 	"checkin ", "activity ", "keepalive ", "balance ", "user-resource ",
 	"panel: 任务", "panel: 一键", "panel: checkin", "panel: 手动",
 	"panel: 队列", "panel: task ", "panel: 接受任务", "panel: 定时成长",

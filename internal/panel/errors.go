@@ -53,7 +53,7 @@ var (
 	reReset    = regexp.MustCompile(`将在\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})|will reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`)
 	// 调度族失败行（scheduler）：`WARN: keepalive 昵称(uid8): <err>` —— 账号标签紧跟任务名，
 	// 没有 acct= 前缀，账号要从这里取。
-	reTask = regexp.MustCompile(`^(?:WARN: |ERR: )?(checkin|keepalive|balance|travel|activity|user-resource|streak-bonus|blackcat|lottery) ([^:]+):`)
+	reTask = regexp.MustCompile(`^(?:WARN: |ERR: )?(checkin|keepalive|balance|travel|activity|user-resource|streak-bonus|lottery) ([^:]+):`)
 )
 
 // taskKinds 调度任务名 → 错误类型（人话）。
@@ -65,7 +65,6 @@ var taskKinds = map[string]string{
 	"activity":      "活跃上报失败",
 	"user-resource": "账号资源查询失败",
 	"streak-bonus":  "连登兑换/抽奖失败",
-	"blackcat":      "夜猫子任务失败",
 	"lottery":       "抽奖失败",
 }
 

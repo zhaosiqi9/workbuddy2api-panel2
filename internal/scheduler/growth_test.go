@@ -15,7 +15,6 @@ func TestNextWakeGrowthIndependent(t *testing.T) {
 		TravelHours:    []int{21},
 		ActivityHours:  []int{10},
 		KeepaliveHours: []int{22},
-		BlackcatHours:  []int{23},
 		GrowthHours:    []int{11},
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 10, 30, 0, 0, cst.Loc))
@@ -36,7 +35,6 @@ func TestNextWakeGrowthDisabled(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		BlackcatDisabled:  true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 10, 30, 0, 0, cst.Loc))
 	if want := time.Date(2026, 9, 12, 9, 0, 0, 0, cst.Loc); !at.Equal(want) {
@@ -75,7 +73,7 @@ func TestRunGrowthNowRunner(t *testing.T) {
 func TestReconfigureGrowthHot(t *testing.T) {
 	s := New(Config{GrowthHours: []int{11}})
 	off := ScheduleParams{
-		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true, BlackcatDisabled: true,
+		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true,
 	}
 	p := off
 	p.GrowthHours = []int{13}

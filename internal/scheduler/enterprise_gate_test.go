@@ -7,9 +7,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
@@ -109,12 +106,6 @@ func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *record
 // 每个子用例都配一组个人号对照（同构造、只差 enterpriseId），证明"没发请求"是门控
 // 生效而不是构造有误——企业版门控与既有 IsGlobal/D4 门控同源。
 func TestEnterpriseGateSkipsGrowthTasks(t *testing.T) {
-	// 把夜猫子的窗口判定钉在窗口内：守卫先于账号循环，不钉住时钟则该用例的
-	// 判别力取决于运行环境的墙钟（本机白天跑 = 什么都没测）。钉住后五个用例
-	// 在任何环境、任何时刻都真正执行。
-	restoreClock := nowForNightWindow
-	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 7, 23, 30, 0, 0, cst.Loc) }
-	t.Cleanup(func() { nowForNightWindow = restoreClock })
 
 	cases := []struct {
 		name string
@@ -126,10 +117,8 @@ func TestEnterpriseGateSkipsGrowthTasks(t *testing.T) {
 		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin"},
 		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report"},
 		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info"},
-		// 夜猫子第一跳不是 heatmap：RunBlackcatNow → BlackcatNeed → ListTasks，
 		// 即 /v2/activity/growth/tasks（问"还差几次"）。mock 返回空任务表 ⇒ need=0
 		// ⇒ 个人号到此为止，只发这一条。
-		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
 		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
 	}
 	for _, c := range cases {
@@ -205,10 +194,6 @@ func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUps
 // 企业形态一律以 enterpriseId 为准（auth.IsEnterprise）。故五类任务必须照常发起上游
 // 调用，与个人号对照完全一致——这是「别再把该章当企业上下文」的回归钉子。
 func TestStampedTokenNotGated(t *testing.T) {
-	restoreClock := nowForNightWindow
-	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, cst.Loc) }
-	t.Cleanup(func() { nowForNightWindow = restoreClock })
-
 	cases := []struct {
 		name string
 		run  func(*Scheduler)
@@ -218,7 +203,6 @@ func TestStampedTokenNotGated(t *testing.T) {
 		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin"},
 		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report"},
 		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info"},
-		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
 		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
 	}
 	for _, c := range cases {
@@ -332,10 +316,6 @@ func apiKeyTestScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
 // 在上游对它都没有意义：必须一个请求都不发。配对断言「额度查询照常」——这是
 // 只 skip 成长、不 continue 整轮的关键（否则面板额度永远不刷新）。
 func TestAPIKeyGateSkipsGrowthTasks(t *testing.T) {
-	restoreClock := nowForNightWindow
-	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 7, 23, 30, 0, 0, cst.Loc) }
-	t.Cleanup(func() { nowForNightWindow = restoreClock })
-
 	cases := []struct {
 		name     string
 		run      func(*Scheduler)
@@ -344,7 +324,6 @@ func TestAPIKeyGateSkipsGrowthTasks(t *testing.T) {
 		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin"},
 		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report"},
 		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info"},
-		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
 		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
 	}
 	for _, c := range cases {

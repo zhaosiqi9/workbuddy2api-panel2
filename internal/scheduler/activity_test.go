@@ -375,7 +375,6 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		BlackcatDisabled:  true,
 		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},

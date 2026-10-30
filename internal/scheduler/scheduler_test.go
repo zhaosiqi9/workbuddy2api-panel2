@@ -33,9 +33,6 @@ func schedFor(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveDisabled = true
 	}
-	if len(cfg.BlackcatHours) == 0 {
-		cfg.BlackcatDisabled = true
-	}
 	if len(cfg.GrowthHours) == 0 {
 		cfg.GrowthDisabled = true
 	}
@@ -85,13 +82,13 @@ func TestEnabledSlotsSingleSourceOfTruth(t *testing.T) {
 	now := time.Date(2026, 10, 15, 10, 0, 0, 0, cst.Loc)
 	all := Config{
 		CheckinHours: []int{9}, TravelHours: []int{8}, ActivityHours: []int{7},
-		KeepaliveHours: []int{6}, BlackcatHours: []int{5}, GrowthHours: []int{4},
+		KeepaliveHours: []int{6}, GrowthHours: []int{4},
 	}
-	if got := New(all).enabledSlots(now); len(got) != 6 {
-		t.Fatalf("启用任务族应为 6 类，got %d: %v", len(got), got)
+	if got := New(all).enabledSlots(now); len(got) != 5 {
+		t.Fatalf("启用任务族应为 5 类，got %d: %v", len(got), got)
 	}
-	if got := New(all).missedToday(now); len(got) != 6 {
-		t.Fatalf("时点全过时 6 类都应补跑，got %v", got)
+	if got := New(all).missedToday(now); len(got) != 5 {
+		t.Fatalf("时点全过时 5 类都应补跑，got %v", got)
 	}
 }
 
@@ -118,7 +115,6 @@ func TestRunCatchesUpMissedSlots(t *testing.T) {
 	s := New(Config{
 		Pool: p, Upstream: up, CheckinHours: []int{past},
 		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true,
-		BlackcatDisabled: true, GrowthDisabled: true,
 	})
 	old := wakeupGraceDelay
 	wakeupGraceDelay = 0 // 测试不等启动宽限
@@ -188,7 +184,6 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		KeepaliveHours:   []int{22},
 		TravelDisabled:   true,
 		ActivityDisabled: true,
-		BlackcatDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, cst.Loc))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, cst.Loc); !at.Equal(want) {
@@ -250,7 +245,6 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		BlackcatDisabled:  true,
 		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
@@ -834,27 +828,6 @@ func TestPausedStillTravels(t *testing.T) {
 	s.RunTravelNow()
 	if got := f.travelCalls.Load(); got != 2 {
 		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 都照常旅行）", got)
-	}
-}
-
-// TestBlackcatEligibility 夜猫子只跑非禁用、非暂停的账号：RunNightChats 逐条发真实
-// glm-5.2 对话，是任务体系里唯一「整任务都是模型对话」的，与暂停号的「让位防风控」
-// 冲突。判据抽成纯函数后可在 23:00–08:00 窗口外直接测（RunBlackcatNow 有窗口前置判断）。
-func TestBlackcatEligibility(t *testing.T) {
-	cases := []struct {
-		name string
-		st   pool.Status
-		want bool
-	}{
-		{"正常账号", pool.Status{}, true},
-		{"暂停选号跳过", pool.Status{Paused: true}, false},
-		{"禁用跳过", pool.Status{Disabled: true}, false},
-		{"两者兼有", pool.Status{Disabled: true, Paused: true}, false},
-	}
-	for _, c := range cases {
-		if got := blackcatEligible(c.st); got != c.want {
-			t.Errorf("%s: blackcatEligible=%v want %v", c.name, got, c.want)
-		}
 	}
 }
 
