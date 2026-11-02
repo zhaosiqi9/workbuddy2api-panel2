@@ -161,7 +161,7 @@ def own_brief():
     return run("git", "ls-files", "*.go", check=False)[1].splitlines()[:250]
 
 
-def analyze(src, lines, pol):
+def analyze(src, lines, pol, hist):
     """clone → agent 读代码 → 差异报告。返回报告路径（失败为 ""）。"""
     up = up_clone(src)
     if not up:
@@ -179,6 +179,7 @@ def analyze(src, lines, pol):
         if readme:
             f.write("\n## README 摘要\n" + readme + "\n")
         f.write("\n## 本仓 Go 文件清单（写「差异」时对照）\n" + "\n".join(own_brief()) + "\n")
+        f.write(hist_brief(hist))
     rules = pol.get("off_limits") or []
     ban = ("本仓明确不做的能力（值得度一律 0，也不要写进「适配」）：\n"
            + "\n".join(f"- {r.get('name')}：{r.get('why', '')}" for r in rules) + "\n") if rules else ""
@@ -197,6 +198,8 @@ def analyze(src, lines, pol):
         "影响: 行为/配置/性能风险\n"
         "「本仓」列必须点名真实 文件:函数；没有就写「缺失」，没核实就写「未核实」。"
         "本仓已有等价实现的项，值得度给 0-1，不要报 3。\n"
+        "材料里「已经提过、被人关掉的提案」是本仓历史：同样的方向别再提，"
+        "重复得先说清和哪一号 PR 不同，说不清就给 0。\n"
         + ban
     )
     code, out = agent(task, int(os.environ.get("AGENT_ANALYZE_TIMEOUT") or 1800), rp)
@@ -236,6 +239,17 @@ def adapt_brief(idea):
         if "适配" in title or "功能" in title or "改动" in title:
             want.append(f"{title}\n{body.strip()[:1800]}")
     return "\n\n".join(want)[:4000] or idea[:2500]
+
+
+def humanize_hint():
+    """PR 正文的「说人话」技能路径。
+
+    技能本身 36 KB，塞进 prompt 会让 agent 静默超时（实测十几 KB 的 prompt 30 分钟零输出），
+    所以只给路径，让它自己读。CI 由 workflow 把 .github/autobot-skills 拷进 $HERMES_HOME/skills。
+    """
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return (f"写正文前先读 {os.path.join(home, 'skills', 'humanizer', 'SKILL.md')}"
+            "（怎么把话说成人话、哪些 AI 味要删）；文件不在就忽略这句。\n")
 
 
 def implement(src, idea, lines):
@@ -282,7 +296,10 @@ def implement(src, idea, lines):
         f"把它写成标准 unified diff 存进 {patch}，不要动工作区任何文件：\n"
         "--- a/internal/foo.go\n+++ b/internal/foo.go\n@@ -10,6 +10,8 @@\n 上下文行\n-旧行\n+新行\n"
         "只能修改已存在的文件；测试加进已存在的 _test.go。直接写 patch，不要回说明。\n"
-        f"写完再写 autobot-pr.md，只含五行：问题 / 改动 / 位置 / 优缺点 / 影响。\n",
+        f"写完再写 autobot-pr.md，第一段用人话，四行，然后空一行，再接五行细节：\n"
+        "人话四行——一句话说清这 PR 干了什么 / 合了之后日常用法有什么变化（没变化就直说）/ 会不会弄坏现在能用的东西（会就说是哪一处） / 要不要我拍板（比如映射是猜的就得人定）\n"
+        "细节五行：问题 / 改动 / 位置 / 优缺点 / 影响。\n"
+        + humanize_hint(),
         int(os.environ.get("AGENT_IMPLEMENT_TIMEOUT") or 1800), patch)
     if not os.path.isfile(patch):
         say(lines, f"{src}: 实现未产出（退出码 {code}）｜{out}")
@@ -368,6 +385,93 @@ def finish(src, pol):
     return True, ""
 
 
+def past_attempts():
+    """本仓已关掉（未被合并）的 AutoBot PR：改过哪些文件 + 人给的理由。
+
+    AutoBot 原先没有任何记忆：yuechuya 那个 tool_call_sequence_broken 提了三次
+    （#29/#31 被人关掉，#140 换个 sha 又来一遍 —— 分支名是报告内容的 sha1，
+    报告重写一次就绕过去了）。这里一次 graphql 把历史取回来，分析时喂给 agent、
+    落地时当冷却闸。
+
+    shortcut: 只取近 100 条已关 PR（一次调用），不翻完整历史；真要更早的再说。
+    """
+    repo = os.environ.get("GITHUB_REPOSITORY") or ""
+    if "/" not in repo:
+        return []
+    owner, name = repo.split("/", 1)
+    q = ('query{repository(owner:%s,name:%s){pullRequests(states:CLOSED,first:100,'
+         'orderBy:{field:CREATED_AT,direction:DESC})'
+         '{nodes{number title url mergedAt closedAt '
+         'files(first:80){nodes{path}} comments(last:3){nodes{body}}}}}}')
+    code, out = run("gh", "api", "graphql", "-f",
+                    "query=" + (q % (json.dumps(owner), json.dumps(name))),
+                    check=False, timeout=180)
+    if code != 0:
+        print(f"历史读取失败（不当致命）：{out[:200]}", flush=True)
+        return []
+    try:
+        nodes = json.loads(out)["data"]["repository"]["pullRequests"]["nodes"] or []
+    except (ValueError, KeyError, TypeError):
+        return []
+    hist = []
+    for n in nodes:
+        title = n.get("title") or ""
+        if n.get("mergedAt") or not title.startswith("autobot:"):
+            continue
+        # 关掉的理由取最后一条非空评论（人通常补在末尾）；自动关闭的那种也留着
+        why = ""
+        for c in (n.get("comments") or {}).get("nodes") or []:
+            if (c.get("body") or "").strip():
+                why = " ".join(c["body"].split())
+        hist.append({
+            "number": n["number"],
+            "title": title,
+            "closed": (n.get("closedAt") or "")[:10],
+            "files": [f["path"] for f in (n.get("files") or {}).get("nodes") or []],
+            "why": why[:400],
+        })
+    return hist
+
+
+def hist_brief(hist):
+    """历史提案写进 agent 的材料文件：跨仓库的重复方向只能靠它拦（同仓库有冷却闸）。"""
+    if not hist:
+        return ""
+    rows = []
+    for h in hist[:20]:
+        rows.append(f"- #{h['number']}（{h['closed']} 关）{h['title']}\n"
+                    f"  改过: {', '.join(h['files'][:12]) or '（未取到）'}\n"
+                    f"  关掉的理由: {h['why'] or '（没写理由）'}")
+    return ("\n## 已经提过、被人关掉的提案（同样的方向别再提）\n"
+            "这些是本仓自己的历史。重复提之前必须在报告里写清楚「这次和 #N 的不同在哪」，"
+            "写不出来就值得度 0。\n" + "\n".join(rows) + "\n")
+
+
+COOLDOWN_DAYS = 14
+
+
+def cooling_down(hist, days=COOLDOWN_DAYS):
+    """仓库 → 上次被关的日期（冷却期内）。人关一次 PR 就是一次明确否决。
+
+    按仓库而不是按文件冷却：panel.go 这种主文件几乎所有改动都会碰，按文件拦会把
+    正常的新功能一起拦掉；「这个仓库刚被否过」才是稳定的信号。
+    """
+    cutoff = time.time() - days * 86400
+    cool = {}
+    for h in hist:
+        m = re.search(r"借鉴 (\S+) 的实现|吸收 (\S+)@", h["title"])
+        src = (m.group(1) or m.group(2)) if m else ""
+        if not src:
+            continue
+        try:
+            t = time.mktime(time.strptime(h["closed"], "%Y-%m-%d"))
+        except ValueError:
+            continue
+        if t > cutoff and t > cool.get(src, (0, ""))[0]:
+            cool[src] = (t, h["number"], h["closed"])
+    return {k: (v[1], v[2]) for k, v in cool.items()}
+
+
 def branch_for(src, idea, pol):
     """报告内容相同 → 分支名相同 → 同一件事只推一次（land_max 才能落到新工作上）。
 
@@ -378,7 +482,17 @@ def branch_for(src, idea, pol):
     return f"{pol['branch_prefix']}{slug}-{hashlib.sha1(idea.encode()).hexdigest()[:7]}"
 
 
-def pick_candidates(reports, land_max, pol, exists):
+def proposal_part(idea):
+    """只扫报告里「适配:」之后的部分。
+
+    对比表必然把上游的多密钥/配额那一行列出来（还常写着「明确不做」），扫全表等于让
+    几乎每份报告都被禁区命中——实测 smart-open/TraeWorkAssistant 就是这么被误拦的。
+    """
+    i = idea.rfind("\n适配")
+    return idea[i:] if i >= 0 else idea
+
+
+def pick_candidates(reports, land_max, pol, exists, cool=None):
     """按值得度降序取前 land_max 条还没落地过的报告，返回 (picked, dups)。
 
     分支名是报告内容的 sha1：同名分支已存在 = 这份报告上一轮已经推过，必须剔掉再数
@@ -391,9 +505,12 @@ def pick_candidates(reports, land_max, pol, exists):
             continue
         src = os.path.basename(path)[:-3].replace("__", "/")
         idea = open(path, encoding="utf-8").read()
-        hit = policy_hit([], idea, pol)
+        hit = policy_hit([], proposal_part(idea), pol)
         if hit:
             banned[path] = hit
+        elif (cool or {}).get(src):
+            n, d = cool[src]
+            banned[path] = f"同一仓库 #{n} 刚被关（{d}），{COOLDOWN_DAYS} 天冷却期内"
         elif exists(branch_for(src, idea, pol)):
             dups.add(path)
         else:
@@ -404,6 +521,15 @@ def pick_candidates(reports, land_max, pol, exists):
 def branch_exists(branch):
     return run("git", "ls-remote", "--exit-code", "--heads", "origin", branch,
                check=False)[0] == 0
+
+
+def pr_title(summary, src):
+    """标题用人话第一行。摘要为空才回落仓库名（旧标题等于没说干什么）。"""
+    for line in (summary or "").splitlines():
+        line = re.sub(r"[*#`]", "", re.sub(r"^[>\-\s]+", "", line)).strip()
+        if line and not line.startswith(("问题", "改动", "位置", "优缺点", "影响")):
+            return "autobot: " + line
+    return f"autobot: 借鉴 {src} 的实现"
 
 
 def land(src, rp, pol, args, lines):
@@ -438,7 +564,7 @@ def land(src, rp, pol, args, lines):
     body = (summary or f"分析报告：`{os.path.basename(rp)}`\n") + \
         "\n- `go build` / `go vet` / `go test ./...` 已通过；合并前请人工确认行为等价。\n"
     run("gh", "pr", "create", "--repo", os.environ["GITHUB_REPOSITORY"], "--base", pol["base"],
-        "--head", branch, "--title", f"autobot: 借鉴 {src} 的实现"[:120],
+        "--head", branch, "--title", pr_title(summary, src)[:120],
         "--body", body, "--label", pol["label"])
     say(lines, f"已开 PR：{branch}")
     run("git", "checkout", "-q", pol["base"])
@@ -466,13 +592,16 @@ def main():
     repos = [args.repo] if args.repo else [r["repo"] if isinstance(r, dict) else r
                                           for r in up["repos"]]
     lines = ["# AutoBot 报告", ""]
+    hist = past_attempts()
+    if hist:
+        say(lines, f"历史：{len(hist)} 个已关掉的 AutoBot PR（冷却中的仓库 {len(cooling_down(hist))} 个）")
 
     if args.phase in ("analyze", "all"):
         todo = shard(repos, args.shard)
         say(lines, f"分析 {len(todo)} 个仓库（共 {len(repos)}，分片 {args.shard or '全部'}）")
         made = 0
         for src in todo:
-            made += 1 if analyze(src, lines, pol) else 0
+            made += 1 if analyze(src, lines, pol, hist) else 0
         if todo and not made:
             # 一个报告都没产出（典型原因：模型额度 429）必须让 job 红，别假装成功
             say(lines, "本片没有产出任何报告")
@@ -486,8 +615,14 @@ def main():
                 p = os.path.join(REPORT_DIR, f)
                 reports.append((report_score(open(p, encoding="utf-8").read()), p))
         reports.sort(reverse=True)
+        if not reports and not args.dry_run:
+            # 分析阶段全挂 / 报告没传过来时这里一份输入都没有，别把「什么都没干」报成绿
+            say(lines, "没有任何输入报告，落地步骤无事可做")
+            write_report(lines)
+            return 1
         land_max = int(up.get("land_max") or 2)
-        picked, dups, banned = pick_candidates(reports, land_max, pol, branch_exists)
+        picked, dups, banned = pick_candidates(reports, land_max, pol, branch_exists,
+                                              cooling_down(hist))
         # 总决策表：每份报告的去向都留痕，人审时不用回头翻 68 个 job
         say(lines, f"## 决策表（{len(reports)} 份报告，land_max={land_max}）")
         say(lines, "| 仓库 | 值得度 | 摘要 | 决定 |")
