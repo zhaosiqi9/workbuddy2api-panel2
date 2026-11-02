@@ -67,7 +67,7 @@ func normalizeModelName(obj map[string]any) {
 // 导出入口不注入 prompt_cache_key（保持既有公开语义）；生产路径由
 // client.prepareBody 调用 prepareBodyOpt 并传入 cache 参数。
 func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64) ([]byte, string) {
-	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, "", nil, "", "", false)
+	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, "", nil, "", "", false, 0)
 	return body, eff
 }
 
@@ -77,7 +77,7 @@ func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts 
 // realm 用于 thinking.model_defaults 的 "realm:model" 精确匹配；policy 为 nil
 // 或未启用时与 …Caps 完全一致。
 func PrepareBodyOptWithEffortPolicy(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy) ([]byte, string) {
-	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, realm, policy, "", "", false)
+	body, _, eff := prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts, maxOut, realm, policy, "", "", false, 0)
 	return body, eff
 }
 
@@ -88,7 +88,7 @@ func PrepareBodyOptWithEffortPolicy(src []byte, sanitize bool, efforts map[strin
 //   - requested 在 injectThinking 之前抓取，因此不含网关补的默认档——它回答
 //     「客户端到底发没发、发的哪一档」（issue #43/#18 的判别依据）；
 //   - effective 是降级后的出站档位，未携带/未知模型/未知档位 → ""。
-func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy, cacheUID, cacheConversation string, injectCache bool) ([]byte, string, string) {
+func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64, realm string, policy *EffortPolicy, cacheUID, cacheConversation string, injectCache bool, keepRounds int) ([]byte, string, string) {
 	if len(src) == 0 {
 		return src, "", ""
 	}
@@ -124,6 +124,9 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 	normalizeImageURL(obj)
 	normalizeStop(obj)
 	dropReasoningContentParts(obj)
+	// 历史裁剪先于 tool 配对：cut 落在整轮边界上，不会切出半个 tool 配对；
+	// 万一客户端自己的历史本来就断了，后面两步照样兜底。
+	trimHistory(obj, keepRounds)
 	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
@@ -179,6 +182,43 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 		return src, requested, effort
 	}
 	return out, requested, effort
+}
+
+// trimHistory 只保留最近 keep 轮对话（issue #99）：一轮 = 一条 user 消息，连同其后
+// 的 assistant/tool 回复。更早的整轮丢弃——长会话的输入 token 几乎全在这里。
+//
+// 三条约束：
+//   - system 消息一条不删。它们是协议与人格，删了上游要么 400 11-128 要么人格丢失；
+//     cut 之前出现的 system 也提到前面保留（客户端把 system 插在中间的情况）。
+//   - cut 只落在 user 下标上，所以保留段开头永远不是 tool 结果——不会切出半个
+//     tool 配对（配不成对的上游直接 400）。客户端自己断掉的历史仍由后面的
+//     repack/cleanup 兜底。
+//   - keep <= 0 时不动 body（默认关闭，与没有这个功能完全一致）。
+func trimHistory(obj map[string]any, keep int) {
+	if keep <= 0 {
+		return
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	users := make([]int, 0, 8)
+	for i, m := range msgs {
+		if mm, ok := m.(map[string]any); ok && mm["role"] == "user" {
+			users = append(users, i)
+		}
+	}
+	if len(users) <= keep {
+		return
+	}
+	cut := users[len(users)-keep]
+	kept := make([]any, 0, len(msgs)-cut+4)
+	for _, m := range msgs[:cut] {
+		if mm, ok := m.(map[string]any); ok && mm["role"] == "system" {
+			kept = append(kept, m)
+		}
+	}
+	obj["messages"] = append(kept, msgs[cut:]...)
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游

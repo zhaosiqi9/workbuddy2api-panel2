@@ -168,6 +168,9 @@ type ModelCostStatus struct {
 	LastSeen time.Time `json:"last_seen"`
 	// Samples 累计观测次数（EMA 收敛度参考）。
 	Samples int `json:"samples,omitempty"`
+	// WinTokens 当前用量窗口内该模型已消费的 token（issue #112 窗口用量调度的输入）。
+	// 0 = 本窗口无用量或调度关闭。运维据此看「为什么这次没选它」。
+	WinTokens int64 `json:"win_tokens,omitempty"`
 }
 
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
@@ -221,6 +224,12 @@ type modelCostEntry struct {
 	// CreditVerified credit 字段显式存在且合法（0 = 确认免费；false = 旧数据/未知）。
 	// 旧版缺 credit 与真实 0 混同；加载时未验证的零价条目降为未知（见 persist.go）。
 	CreditVerified bool
+	// WinStart/WinTokens 用量窗口起点与该窗口内累计消费的 token（issue #112 窗口
+	// 用量调度）。**不持久化**（stateModelCost 不带这两个字段）：重启后窗口重新
+	// 起算，与 lastUsed/usedSeq 同口径——路由运行态不跨进程，避免拿旧窗口惩罚
+	// 一个刚重启过的池子。
+	WinStart  time.Time
+	WinTokens int64
 }
 type entry struct {
 	a       *auth.Auth
@@ -368,6 +377,20 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 		return modelCostEntry{}, false // 过期：时段性优惠（夜间免费）不得跨时段生效
 	}
 	return mc, true
+}
+
+// windowTokens 返回该账号在 model 上当前窗口内累计消费的 token；窗口已过期、
+// 未开启调度（window<=0）或从未记录返回 0。
+// 调用方必须已持有 p.mu（读 e.modelCost）。
+func (e *entry) windowTokens(model string, window time.Duration, now time.Time) int64 {
+	if window <= 0 || model == "" {
+		return 0
+	}
+	mc, ok := e.modelCost[model]
+	if !ok || mc.WinStart.IsZero() || now.Sub(mc.WinStart) >= window {
+		return 0
+	}
+	return mc.WinTokens
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
@@ -642,6 +665,11 @@ const (
 // 增量成本只是「该请求本可打免费号、实际打了可能收费的号」的期望计费差，
 // 且 tier 1 枯竭（活跃模型全号已学）后税基收敛到 0。config 显式 "0" 关停。
 const defaultCostExploreInterval = 30 * time.Minute
+
+// defaultBalanceWindow 窗口用量调度默认窗口（issue #112）。取 1h：上游 6004 限流的
+// 观察周期是「短时高频」，一小时足够让热点号的累计用量拉开差距，又不会长到让早上的
+// 用量惩罚晚上的请求（长窗口等于按天摊平，调度意义消失）。config 显式 "0" 关停。
+const defaultBalanceWindow = time.Hour
 
 // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
 // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为

@@ -69,6 +69,11 @@ type Pool struct {
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// balanceWindow 窗口用量调度窗口（issue #112，SetBalanceWindow 注入；默认 1h，
+	// 0 = 关闭）。按 (账号, 模型) 在本窗口内累计的 token 反比降权：只靠 credits
+	// 加权时余额掉几分与烧掉百万 token 在权重上几乎无差别，热点号会一路烧到 6004
+	// 限额而同期其他号闲置。软降权，不排除（保底/优先级/占比仍是硬语义，不受它影响）。
+	balanceWindow time.Duration
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -116,6 +121,7 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		preferExpiring:     true,
+		balanceWindow:      defaultBalanceWindow,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -228,6 +234,14 @@ func (p *Pool) SetPreferExpiring(enabled bool, window time.Duration) {
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
 	p.expiringWindow = window
+}
+
+// SetBalanceWindow 注入窗口用量调度窗口（issue #112）；d<=0 = 关闭。
+// 关掉后不再记账（NoteModelCost 跳过）也不再降权，与未引入本功能的旧版行为一致。
+func (p *Pool) SetBalanceWindow(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.balanceWindow = d
 }
 
 // SetAccountPriority 注入账号优先级表（uid → 正整数，小 = 先消耗；issue #62）。

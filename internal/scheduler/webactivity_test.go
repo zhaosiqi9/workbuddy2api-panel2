@@ -1,7 +1,10 @@
 // webactivity_test.go 网页通道每日活跃腿的回归钉。
 //
-// 这条腿的存在理由（issue #111 实测）：国际版每日 30/50 积分只认「跑完的网页
-// agent 会话」。三条钉分别管：
+// 这条腿最初的理由（issue #111 首次实测）：国际版每日 30/50 积分只认「跑完的网页
+// agent 会话」。**该前提后续被实测推翻**——每日 30 积分跟随活跃上报到账，从没跑过
+// 网页会话的对照号照样拿满（见 issue #111 后续评论），故这条腿默认关
+// （schedule.web_activity_enabled 缺省 false），代码留着等上游判定再变。
+// 三条钉分别管：
 //
 //	CN 账号零调用     —— 国内版没这套机制，建云会话纯属白花钱
 //	建/接/跑/收尾全链 —— 少任一步（尤其不接沙箱、不 stop）都会静默失效
@@ -151,6 +154,35 @@ func TestWebActivityGlobalRunsFullChain(t *testing.T) {
 		if got != "Bearer sandbox-token" {
 			t.Errorf("ACP Authorization=%q want \"Bearer sandbox-token\"（用账号 token 会 401 12801）", got)
 		}
+	}
+}
+
+// TestWebActivityGateDefaultOff 缺省配置下活跃轮次不再碰网页腿：国际号只发
+// /v2/report，零 console/as 调用（否则每天白建一条真实会话、占一条活跃名额）。
+func TestWebActivityGateDefaultOff(t *testing.T) {
+	withGlobalSwitch(t)
+	fastActivity(t)
+	newSched := func(disabled bool) (*Scheduler, *webAgentFake) {
+		f := newWebAgentFake(t)
+		p := pool.New("")
+		p.Add(globalAccount(t, "g1"))
+		up := &upstream.Client{HTTP: f.srv.Client(), GlobalEnabled: true,
+			ChatBaseCN: f.srv.URL, BillingBaseCN: f.srv.URL,
+			ChatBaseGlobal: f.srv.URL, BillingBaseGlobal: f.srv.URL}
+		return New(Config{Pool: p, Upstream: up, WebActivityDisabled: disabled}), f
+	}
+
+	off, fOff := newSched(true)
+	off.RunActivityNow()
+	if fOff.sawPath("/console/as/conversations/") {
+		t.Errorf("关闭时不该建云会话: %v", fOff.paths)
+	}
+
+	// 对照：同一路径把开关打开就会建会话，证明上面那条是开关生效而不是链路坏了。
+	on, fOn := newSched(false)
+	on.RunActivityNow()
+	if !fOn.sawPath("/console/as/conversations/") {
+		t.Errorf("打开时应当建云会话: %v", fOn.paths)
 	}
 }
 

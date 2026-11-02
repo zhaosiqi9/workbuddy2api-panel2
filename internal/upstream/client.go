@@ -4,13 +4,16 @@ package upstream
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -21,10 +24,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/andybalholm/brotli"
+
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
@@ -792,7 +798,8 @@ type apiEnvelope struct {
 
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
-	HTTP *http.Client
+	HTTP      *http.Client
+	ProxyPool *proxypool.Manager
 
 	// refreshMu 保护 refreshing/renewed 两张刷新表：
 	//   refreshing 同一个 refresh token 的在途刷新（并发调用共享结果）；
@@ -822,6 +829,15 @@ type Client struct {
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
 
+	// TLSFingerprint 出站 ClientHello 指纹档位："node"（默认，复刻官方
+	// Node/OpenSSL 形态）或 "go"（crypto/tls 原生，排障/回滚用）。
+	// 空值等价 "node"。用 SetTLSFingerprint 改，别直接赋值——直接赋值不会
+	// 重建拨号闭包，等于没生效。
+	TLSFingerprint string
+	// dialer 出站拨号器（SetDNSDialer 会替换它）。存一份引用是为了让
+	// SetTLSFingerprint 能重建闭包时不丢失自定义 DNS。
+	dialer *net.Dialer
+
 	// DumpRequestMax 落盘文件里出站请求体片段的上限（字节）；0 = 默认 256 KB。
 	// 见 dump.go。
 	DumpRequestMax int
@@ -850,6 +866,9 @@ type Client struct {
 	// 探测与合并见 global_models.go）。目录权威 = 桌面端 UA 族，见该文件注释。
 	globalModels fetchGlobalModelsCache
 
+	// KeepRecentRounds 只保留最近 N 轮对话（prompt.keep_recent_rounds，issue #99）；
+	// 0 = 关闭。热改由面板保存配置触发，见 payload.go trimHistory。
+	KeepRecentRounds atomic.Int64
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
@@ -926,10 +945,15 @@ type CreditObserver func(uid string, credits int64)
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
+	d := newDialer()
 	tr := newTransport()
+	tr.DialContext = d.DialContext
+	tr.DialTLSContext = newTLSDialer(d, nil, TLSFingerprintNode)
 	c := &Client{
-		HTTP:     &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP: &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		HTTP:           &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:       &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		TLSFingerprint: TLSFingerprintNode,
+		dialer:         d,
 		// ChatBaseCN 取官方桌面端的 endpoint（product.json），不是备选入口
 		// copilot.tencent.com —— 后者是官方 NetworkFailover 里的备选，主入口才是
 		// www.workbuddy.cn。生产实测（同一账号）：/v3/config、billing 汇总、chat
@@ -1103,7 +1127,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。与 body 归一化共用
 	// prepareBodyOpt 的同一次 map 解析，不再二次 Unmarshal/Marshal。
-	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, realm, c.EffortPolicy(), uid, conversationID, true)
+	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, realm, c.EffortPolicy(), uid, conversationID, true, int(c.KeepRecentRounds.Load()))
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -1188,11 +1212,77 @@ func (c *Client) webBase(a *auth.Auth) string {
 	return "https://www.workbuddy.cn"
 }
 
+// decodeResponseBody 按 Content-Encoding 解压响应体。
+//
+// 为什么必须自己解：一旦请求显式声明 Accept-Encoding，net/http 就**关闭透明
+// 解压**（Transport 只在「自己加的 gzip」时才解）。不解这一层，doJSON 拿到
+// brotli/gzip 字节直接 json.Unmarshal → 所有 RPC 链路全废，而且 400 分支的
+// Classify 会把压缩体当文本分类，罚号逻辑跟着错。
+//
+// 支持 gzip / deflate / br —— 与真机 Accept-Encoding 声明的前三项对齐。
+// `compress`(LZW) 官方虽声明但服务端从不回，这里明确报错而不是返回乱码。
+func decodeResponseBody(resp *http.Response, raw []byte) ([]byte, error) {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if enc == "" || enc == "identity" || len(raw) == 0 {
+		return raw, nil
+	}
+	// 多段编码（如 "gzip, br"）按逆序解：最后声明的先解。
+	parts := strings.Split(enc, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		e := strings.TrimSpace(parts[i])
+		var err error
+		switch e {
+		case "", "identity":
+			continue
+		case "gzip", "x-gzip":
+			raw, err = io.ReadAll(gzipReader(bytes.NewReader(raw)))
+		case "deflate":
+			// RFC 7230 的 deflate 实际可能是 zlib 包装或裸 deflate，两种都试。
+			raw, err = inflate(raw)
+		case "br":
+			raw, err = io.ReadAll(brotli.NewReader(bytes.NewReader(raw)))
+		default:
+			return nil, fmt.Errorf("不支持的内容编码 %q（响应头 Content-Encoding）", e)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("解压 %s 失败: %w", e, err)
+		}
+	}
+	return raw, nil
+}
+
+// gzipReader 用标准库建 gzip 读取器（封一层便于统一错误处理）。
+func gzipReader(r io.Reader) io.Reader {
+	zr, err := gzip.NewReader(r)
+	if err != nil {
+		return errReader{err}
+	}
+	return zr
+}
+
+// inflate 解 deflate：先按 zlib 试，失败再按裸 deflate 试。
+func inflate(raw []byte) ([]byte, error) {
+	if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
+		defer zr.Close()
+		if out, err := io.ReadAll(zr); err == nil {
+			return out, nil
+		}
+	}
+	fr := flate.NewReader(bytes.NewReader(raw))
+	defer fr.Close()
+	return io.ReadAll(fr)
+}
+
+// errReader 把构造期的错误推迟到 Read 时返回。
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1200,6 +1290,10 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+	// 必须在 Classify / Unmarshal 之前解压：这两步都按文本处理 raw。
+	if raw, err = decodeResponseBody(resp, raw); err != nil {
+		return nil, err
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
@@ -1404,7 +1498,7 @@ func (c *Client) doRefresh(a *auth.Auth, rtSnapshot string) *refreshResult {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return &refreshResult{err: err, at: time.Now()}
 	}
@@ -1560,7 +1654,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
 		doStart := time.Now()
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := c.do(req, a, true)
 		if timing != nil {
 			timing.Do += max(time.Since(doStart), time.Nanosecond)
 		}
@@ -1900,7 +1994,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2382,7 +2476,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -152,7 +152,8 @@ func TestChatMetaCacheKeySource(t *testing.T) {
 			var gotConv string
 			c := testClient(func(r *http.Request) (*http.Response, error) {
 				gotBody, _ = io.ReadAll(r.Body)
-				gotConv = r.Header.Get("X-Conversation-ID")
+				// headerFold 而非 Get：出站 key 已是官方拼写 X-Conversation-ID
+				gotConv = headerFold(r.Header, "X-Conversation-ID")
 				return &http.Response{StatusCode: 200,
 					Header: http.Header{"Content-Type": []string{"text/event-stream"}},
 					Body:   io.NopCloser(strings.NewReader("data: [DONE]\n\n"))}, nil
@@ -280,7 +281,7 @@ func TestPrepareBodyCacheKeyEquivalence(t *testing.T) {
 	for _, in := range bodies {
 		t.Run(in, func(t *testing.T) {
 			oldBody := InjectPromptCacheKey(PrepareBodyOpt([]byte(in), false), uid, conv)
-			newBody, _, _ := prepareBodyOpt([]byte(in), false, true, nil, nil, nil, "", nil, uid, conv, true)
+			newBody, _, _ := prepareBodyOpt([]byte(in), false, true, nil, nil, nil, "", nil, uid, conv, true, 0)
 			if !bytes.Equal(oldBody, newBody) {
 				t.Fatalf("body mismatch\nold=%s\nnew=%s", oldBody, newBody)
 			}

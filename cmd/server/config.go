@@ -61,6 +61,14 @@ type Config struct {
 		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
+		// RequestArchiveContext 是否把会话上下文（system + messages / 出图 prompt）记入
+		// 请求事件，面板「请求事件日志」点行展开即可看当轮发出去的内容。缺省 false。
+		//
+		// 为什么默认关：这是**用户提示词**，比 IP 敏感一个量级——开了等于把每次对话的
+		// 原文落到 state 目录的归档文件里（保留 7 天、上限 100MiB）。排查「上游为什么
+		// 拒这条请求」时它是唯一能对上的证据，但那该是运维主动开的临时手段，
+		// 不是默认行为。热生效，无需重启。
+		RequestArchiveContext bool `json:"request_archive_context"`
 	} `json:"logging"`
 
 	Server struct {
@@ -110,6 +118,11 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务队列
+		// WebActivityEnabled 国际版「网页通道」每日活跃腿（issue #111）。**缺省 false**，
+		// 与上面五个「缺省 true」的开关相反：上游实测每日 30 积分由活跃上报本身触发，
+		// 网页会话不是必要条件；这条腿每天要为每个国际号建一条真实会话并占一条活跃
+		// 名额（上限 10），没必要默认开着。显式 true 才跑。
+		WebActivityEnabled bool `json:"web_activity_enabled"`
 
 		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
 		// 余额刷新）对**已禁用（disabled）**的账号也执行。
@@ -204,6 +217,12 @@ type Config struct {
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
+		// TLSFingerprint 出站 ClientHello 指纹档位：
+		//   "node"（缺省）复刻官方 Node/OpenSSL 形态，JA3/JA4 与真机一致；
+		//   "go"   用 crypto/tls 原生形态（排障 / 回滚用）。
+		// 默认 node：不配也走复刻，避免"忘了配就裸奔"。
+		// 选 go 的唯一理由是指纹复刻导致握手异常时紧急回滚。
+		TLSFingerprint string `json:"tls_fingerprint"`
 		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
@@ -306,6 +325,10 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// KeepRecentRounds 只保留最近 N 轮对话（issue #99）：出站前丢掉更早的
+		// user/assistant/tool 消息，system 全留。0 = 关闭（全量透传）。
+		// 多轮长对话的输入 token 主要花在这上面；丢的是上下文而不是协议。
+		KeepRecentRounds int `json:"keep_recent_rounds"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
@@ -344,6 +367,11 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// BalanceWindow 窗口用量调度窗口（issue #112，默认 "1h"，"0" 关停）：
+		// 按 (账号, 模型) 在该窗口内累计消费的 token 反比降权，把热点号打散，
+		// 避免一个号烧到 6004 限额而同期其他号闲置。与快过期加权/闲置补偿叠加。
+		// 软降权：积分保底、账号优先级、账号占比这些硬语义不受影响。
+		BalanceWindow string `json:"balance_window"`
 		// ReserveCredits 保留积分阈值：余额已知且 <= 该值的账号停止接单（仍在池中、
 		// 照常跑定时任务，充值后自动恢复）。上游余额耗尽会发提醒短信，设阈值即避免
 		// 被用到 0。未配置（键缺席）→ 默认 10；显式写 0 = 关闭；从未查到余额的账号不受影响。
@@ -442,6 +470,8 @@ type Config struct {
 	KeepaliveRefreshWindowDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// BalanceWindowDur 解析后的窗口用量调度窗口（issue #112）；0 = 关停。
+	BalanceWindowDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// ShutdownTimeoutDur 解析后的优雅关停窗口；0 = 不等待在途请求直接退。
@@ -521,6 +551,8 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// 窗口用量调度默认 1h（issue #112：热点号降权，把流量摊给闲置号）；"0" 关停。
+	c.Pool.BalanceWindow = "1h"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -655,6 +687,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
 		c.Upstream.UserAgent = v
 	}
+	if v := os.Getenv("WB2A_TLS_FINGERPRINT"); v != "" {
+		c.Upstream.TLSFingerprint = v
+	}
 	if v := os.Getenv("WB2A_CLIENT_VERSION"); v != "" {
 		c.Upstream.ClientVersion = v
 	}
@@ -788,6 +823,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_SOFT_RATE", "cooldown.soft_rate", ""}, {"WB2A_SOFT_RATE_MAX", "cooldown.soft_rate_max", ""},
 		{"WB2A_TIMEOUT_SECONDS", "upstream.timeout_seconds", "int"}, {"WB2A_HEADER_TIMEOUT_SECONDS", "upstream.header_timeout_seconds", "int"},
 		{"WB2A_IDLE_TIMEOUT_SECONDS", "upstream.idle_timeout_seconds", "int"}, {"WB2A_USER_AGENT", "upstream.user_agent", ""},
+		{"WB2A_TLS_FINGERPRINT", "upstream.tls_fingerprint", ""},
 		{"WB2A_CLIENT_VERSION", "upstream.client_version", ""}, {"WB2A_CLI_VERSION", "upstream.cli_version", ""},
 		{"WB2A_CLIENT_NAME", "upstream.client_name", ""}, {"WB2A_DEVICE_TOKEN", "upstream.device_token", ""},
 		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
@@ -941,6 +977,16 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 窗口用量调度窗口（issue #112）：空值回落默认 1h；"0" 合法（关停）；负值钳 0。
+	if c.Pool.BalanceWindow == "" {
+		c.Pool.BalanceWindow = "1h"
+	}
+	if c.BalanceWindowDur, err = time.ParseDuration(c.Pool.BalanceWindow); err != nil {
+		return fmt.Errorf("pool.balance_window: %w", err)
+	}
+	if c.BalanceWindowDur < 0 {
+		c.BalanceWindowDur = 0
 	}
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {

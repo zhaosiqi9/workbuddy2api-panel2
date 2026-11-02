@@ -143,7 +143,7 @@ func (c *Client) webJSON(ctx context.Context, a *auth.Auth, method, url string, 
 	if err != nil {
 		return err
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return err
 	}
@@ -297,7 +297,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 	streamReq.Header.Set("Accept", "text/event-stream")
 	streamReq.Header.Set("Authorization", "Bearer "+sess.Token)
 	streamReq.Header.Set("User-Agent", globalWebUA)
-	stream, err := c.chatHTTP().Do(streamReq)
+	stream, err := c.do(streamReq, a, true)
 	if err != nil {
 		return res, fmt.Errorf("acp sse: %w", err)
 	}
@@ -350,7 +350,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 	}()
 
 	rpc := func(rid int, method string, params any) error {
-		return c.acpPost(ctx, sess, connID, rid, method, params)
+		return c.acpPost(ctx, a, sess, connID, rid, method, params)
 	}
 	if err := rpc(1, "initialize", map[string]any{
 		"protocolVersion": acpProtocolVersion,
@@ -412,7 +412,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 // 注意 Authorization 用的是**沙箱 token**（sess.Token），不是账号 access token：
 // 用账号 token 会 401 `12801:鉴权失败`，而 SSE 通道照样 200——这是本实现第一次
 // 落地时踩的坑（见文件头第 1 条）。
-func (c *Client) acpPost(ctx context.Context, sess WebSession, connID string, rid int, method string, params any) error {
+func (c *Client) acpPost(ctx context.Context, a *auth.Auth, sess WebSession, connID string, rid int, method string, params any) error {
 	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
 	if err != nil {
 		return err
@@ -426,7 +426,7 @@ func (c *Client) acpPost(ctx context.Context, sess WebSession, connID string, ri
 	req.Header.Set("Acp-Connection-Id", connID)
 	req.Header.Set("Authorization", "Bearer "+sess.Token)
 	req.Header.Set("User-Agent", globalWebUA)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return err
 	}

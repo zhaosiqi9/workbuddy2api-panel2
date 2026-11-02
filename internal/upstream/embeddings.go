@@ -55,7 +55,7 @@ func (c *Client) Embeddings(ctx context.Context, a *auth.Auth, model string, inp
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.ChatHeaders(req, a, "", ChatMeta{})
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, err
 	}

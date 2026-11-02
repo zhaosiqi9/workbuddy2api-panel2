@@ -1,8 +1,9 @@
 // Package reqlog 记录脱敏的请求级指标与可选 JSONL 归档。
 //
 // 内存指标有界保存最近 100 条并维护进程级计数；磁盘归档只写请求元数据，
-// 不写提示词、响应正文、Authorization 或其它凭证。可选的调用来源（客户端 IP /
-// User-Agent，见 Event.ClientIP/UserAgent）由 server 按配置开关决定是否填充。
+// 不写响应正文、Authorization 或其它凭证。可选的调用来源（客户端 IP / User-Agent，
+// 见 Event.ClientIP/UserAgent）与会话上下文（见 Event.Context）都由 server 按配置
+// 开关决定是否填充——提示词默认不落盘。
 // 归档队列满时丢弃并计数，不允许日志写盘阻塞模型请求。
 package reqlog
 
@@ -86,14 +87,25 @@ type Event struct {
 	UserAgent       string `json:"user_agent,omitempty"`
 	Mode            string `json:"mode,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	ReasoningTokens int64  `json:"reasoning_tokens,omitempty"`
-	ExecutorType    string `json:"executor_type,omitempty"`
+	// ReasoningEffortRequested 客户端原始请求的思考档位（reasoning_effort / reasoningEffort
+	// 原值；空字符串 = 客户端没携带）。与上一列（生效值）配对：生效值可能来自网关补默认档、
+	// 策略改写或就近降级——只给生效值时，「客户端要了 max」与「客户端什么都没发、网关补了
+	// max」在事件页/JSONL 里长得一模一样（issue #43 的读法歧义）。
+	// **刻意不带 omitempty**：旧归档行没有这个键（「不知道客户端发了什么」），新行恒有
+	// （空串「确认客户端没发」）——两种情况在事件页里要能分开。
+	ReasoningEffortRequested string `json:"reasoning_effort_requested"`
+	ReasoningTokens          int64  `json:"reasoning_tokens,omitempty"`
+	ExecutorType             string `json:"executor_type,omitempty"`
 	// ToolsDeclared / ToolCalls 本轮的「工具面」观测量（issue #44）：声明了几个工具、
 	// 实际拿到几个工具调用。ToolsDeclared>0 且 ToolCalls==0 就是一次「零工具调用
 	// 收尾」——上游把本该调工具的回合当成正常完成，客户端据此认为任务做完、工具一次
 	// 没跑。只记数量，不记工具名与参数。
 	ToolsDeclared int `json:"tools_declared,omitempty"`
 	ToolCalls     int `json:"tool_calls,omitempty"`
+	// Context 本轮请求的会话上下文（system + messages，或出图/embedding 的 prompt），
+	// 由 logging.request_archive_context 决定是否填充（缺省关，空则省略）。
+	// 这是用户数据：默认不开，开了等于把提示词落到 state 目录的归档文件里。
+	Context json.RawMessage `json:"context,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

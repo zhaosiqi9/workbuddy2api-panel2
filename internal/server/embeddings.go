@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
@@ -195,6 +196,9 @@ func (h *Handler) embeddings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lastErr = err
+		if proxypool.IsError(err) {
+			break
+		}
 		// 模型不存在：换号无意义（注册表是按模型不是按账号），且要给出 OpenAI 的 404 语义。
 		if errors.Is(err, upstream.ErrEmbeddingModelNotFound) {
 			writeOpenAIError(w, http.StatusNotFound, "model_not_found",
@@ -231,6 +235,8 @@ func (h *Handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	status, code := http.StatusBadGateway, "upstream_error"
 	var ue *upstream.Error
 	switch {
+	case proxypool.IsError(lastErr):
+		status, code = http.StatusServiceUnavailable, "proxy_unavailable"
 	case len(tried) == 0:
 		status, code = http.StatusServiceUnavailable, "no_account"
 		lastErr = fmt.Errorf("没有可用的 %s 账号", realm)

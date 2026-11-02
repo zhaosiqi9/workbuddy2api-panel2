@@ -355,20 +355,22 @@ func CodeFatal(code int) bool {
 // DecorateAuthURL 按官方 CLI 行为补齐授权链接参数（对应 appendAuthUrlParams /
 // appendLoginPageHintParams）：
 //
-//	version=<ClientVersion>   官方对每个站点都加
 //	ww_device_nonce=<nonce>   官方仅 platform=workbuddy 且拿到设备 nonce 时加
 //
+// **不发 version**：2026-10-31 实测，workbuddy.ai 授权页的 bundle（index-oMkbFDfl.js）
+// 只从 URL 读 `platform` 与 `fromSource`，`version` 一次都没读过；去掉后真机登录照样
+// 成功（global 号 204af49d 入池）。而本仓填的 version 与真机包不同版本（链接 2.176.0
+// vs 桌面端 5.9.4/内置 CLI 2.165.0），一旦上游开始读它就是「错的指纹」——与
+// ww_device_nonce 同一条原则：错值比缺值更容易被判异常。
+//
 // 本仓没有桌面端 Turing 设备 SDK，nonce 只能由部署侧提供；为空则不加——不伪造
-// 设备指纹，错值比缺值更容易被上游风控判异常。raw 解析失败时原样返回。
+// 设备指纹。raw 解析失败时原样返回。
 func DecorateAuthURL(raw string, s Site, nonce string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return raw
 	}
 	q := u.Query()
-	if q.Get("version") == "" {
-		q.Set("version", ClientVersion)
-	}
 	if s.Platform == "workbuddy" && nonce != "" && q.Get("ww_device_nonce") == "" {
 		q.Set("ww_device_nonce", nonce)
 	}

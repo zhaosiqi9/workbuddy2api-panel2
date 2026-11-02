@@ -8,6 +8,9 @@ on:
       - ".github/workflows/autobot.yml"
       - "AutoBot.yml"
       - "scripts/autobot.py"
+  # PR 阶段也要跑：此前只有 push/tag 触发，等于合并前零门禁，坏代码合进 main
+  # 才第一次跑 go test。fork PR 拿不到 contents: write，只会构建不会发版。
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -24,6 +27,12 @@ jobs:
 
       - name: test
         run: go test ./...
+
+      # 出站头与官方真机夹具对拍（默认跳过，CI 显式开启作门禁）。
+      # 夹具是 WorkBuddy 桌面端真机抓包原文；任何头名/值/大小写漂移都会红。
+      # 改夹具必须同时说明抓包依据，否则等于自己给自己放水。
+      - name: official-head parity
+        run: WB2A_PARITY=1 go test ./internal/upstream -run TestOfficialParity -v
 
       # ponytail: 标签发版用标签名，避免 CI 时钟和标签差一分钟变成两个号。
       - name: version
@@ -91,7 +100,10 @@ jobs:
           if-no-files-found: error
 
       - name: release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # 只有打 v* 标签才发版。此前 workflow_dispatch 也能走到这里，会基于 main
+        # HEAD 隐式建 v* 标签并连带触发镜像发布，绕过「打标签才发版」的约定；
+        # dispatch 现在只构建 + 上传 artifact（手动验证用）。
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "v${VERSION}" dist/*.zip --title "v${VERSION}" --generate-notes

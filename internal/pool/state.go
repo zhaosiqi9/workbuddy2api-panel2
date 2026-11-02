@@ -276,8 +276,20 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	const alpha = 0.3
 	prev, seen := e.modelCost[model]
+	// 窗口用量（issue #112）：跨窗口重置后累加本次 token。单价是 EMA、用量是累计，
+	// 分字段存放——混在一处会把两者都算错。调度关闭（window<=0）时干脆不记账。
+	nowTS := time.Now()
+	var winStart time.Time
+	var winTokens int64
+	if p.balanceWindow > 0 {
+		winStart, winTokens = prev.WinStart, prev.WinTokens
+		if winStart.IsZero() || nowTS.Sub(winStart) >= p.balanceWindow {
+			winStart, winTokens = nowTS, 0
+		}
+		winTokens += int64(tokens)
+	}
 	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1, CreditVerified: true}
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: nowTS, Samples: 1, CreditVerified: true, WinStart: winStart, WinTokens: winTokens}
 	} else {
 		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
 		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
@@ -286,9 +298,11 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		}
 		e.modelCost[model] = modelCostEntry{
 			CostPer1k:      prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:       time.Now(),
+			LastSeen:       nowTS,
 			Samples:        prev.Samples + 1,
 			CreditVerified: true,
+			WinStart:       winStart,
+			WinTokens:      winTokens,
 		}
 	}
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
@@ -914,6 +928,7 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 			CostPer1k: mc.CostPer1k,
 			LastSeen:  mc.LastSeen,
 			Samples:   mc.Samples,
+			WinTokens: e.windowTokens(m, p.balanceWindow, now),
 		})
 	}
 	return rows

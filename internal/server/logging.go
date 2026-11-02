@@ -465,6 +465,9 @@ type requestTrace struct {
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+	// context 本轮会话上下文（见 archiveContext），由 logging.request_archive_context
+	// 决定是否填充；关掉时保持 nil，事件里不出现该字段。
+	context json.RawMessage
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -475,6 +478,79 @@ func (t *requestTrace) captureClientInfo(r *http.Request) {
 	}
 	t.clientIP = clientIPForLog(r)
 	t.userAgent = logfmt.Truncate(r.UserAgent(), maxUserAgentLen)
+}
+
+// contextMaxBytes 单个事件的上下文上限。内存只留 100 条事件，16KB × 100 = 1.6MB
+// 封顶；归档里也是同一份（超长上下文按「丢最旧的轮次」收敛，不截成半个 JSON）。
+const contextMaxBytes = 16 << 10
+
+// archiveContext 从入站请求体里抽出会话上下文（system + messages，或出图/embedding
+// 的 prompt），供面板「请求事件日志」展开查看。开关关闭时调用方不调用本函数。
+//
+// 只取这三段：tools / 采样参数 / 传输字段与「上下文」无关，体积还可能吃掉整个预算。
+// 超限时丢最旧的消息，仍超就把最后一条的 content 截断——保持输出始终是合法 JSON，
+// 面板按结构渲染而不是按截断的文本渲染。
+func archiveContext(body []byte) json.RawMessage {
+	var in struct {
+		System   any   `json:"system"`
+		Messages []any `json:"messages"`
+		Prompt   any   `json:"prompt"`
+	}
+	if json.Unmarshal(body, &in) != nil {
+		return nil
+	}
+	out := map[string]any{}
+	if in.System != nil {
+		out["system"] = in.System
+	}
+	if in.Prompt != nil {
+		out["prompt"] = in.Prompt
+	}
+	for len(in.Messages) > 0 {
+		out["messages"] = in.Messages
+		b, err := json.Marshal(out)
+		if err != nil {
+			return nil
+		}
+		if len(b) <= contextMaxBytes {
+			return b
+		}
+		if len(in.Messages) > 1 {
+			in.Messages = in.Messages[1:] // 丢最旧一轮，保留最近对话
+			continue
+		}
+		// 单条就超预算（贴了一大段代码）：把 content 截成串。非字符串（多模态块数组）
+		// 不再拆——整条返回，超出的由上游 context 上限决定，不在这里改结构。
+		if msg, ok := in.Messages[0].(map[string]any); ok {
+			if s, ok := msg["content"].(string); ok {
+				msg["content"] = logfmt.Truncate(s, contextMaxBytes/2) + "…（超长已截断）"
+				if b, err := json.Marshal(out); err == nil {
+					return b
+				}
+			}
+		}
+		break
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	// 没有 messages、只有超长 system / prompt（大段 system 提示词）时上面那条收敛路径
+	// 不触发，这里兜一次，否则单个事件能撑到几 MB 进归档。
+	if len(b) > contextMaxBytes {
+		for _, k := range []string{"system", "prompt"} {
+			if s, ok := out[k].(string); ok {
+				out[k] = logfmt.Truncate(s, contextMaxBytes/2) + "…（超长已截断）"
+			}
+		}
+		if b, err = json.Marshal(out); err != nil {
+			return nil
+		}
+	}
+	return b
 }
 
 // clientIPForLog 提取用于日志展示的客户端 IP。
@@ -542,6 +618,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.CacheMissTokens = int64(s.cacheMiss)
 		e.Mode = s.mode
 		e.ReasoningEffort = s.effort
+		e.ReasoningEffortRequested = s.effortReq
 		if s.think >= 0 {
 			e.ReasoningTokens = int64(s.think)
 		}
@@ -550,6 +627,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	e.Context = t.context
 	e.ExecutorType = deriveExecutorType(t.userAgent)
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
@@ -681,12 +759,15 @@ func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, st
 	// 「客户端要什么 / 网关实际发什么 / 根本没档位」三类情况：
 	//   - 降级：effort=max->high（issue #43：只报生效值会被读成客户端没发 max）
 	//   - 客户端关思考（off/none/disabled）：生效档位会被清空，显示客户端原值 effort=off
+	//   - 客户端没带、网关补齐了默认档：effort=- ->max（"-" 是客户端侧；别读成降级）
 	//   - 完全没档位：effort=-（网关关闭策略或模型不支持档位时就是这一种）
 	switch {
 	case effort != "" && effortReq != "" && !strings.EqualFold(effortReq, effort):
 		split += " effort=" + effortReq + "->" + effort
-	case effort != "":
+	case effort != "" && effortReq != "":
 		split += " effort=" + effort
+	case effort != "":
+		split += " effort=- ->" + effort
 	case effortReq != "":
 		split += " effort=" + effortReq
 	default:

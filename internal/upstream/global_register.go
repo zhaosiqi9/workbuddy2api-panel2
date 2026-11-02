@@ -73,8 +73,8 @@ func (c *Client) globalRegisterReq(method, url, token string, body any, base str
 }
 
 // globalRegisterJSON 发注册链路请求并解外层信封（code/msg）。
-func (c *Client) globalRegisterJSON(req *http.Request) (code int, msg string, raw json.RawMessage, err error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) globalRegisterJSON(req *http.Request, a *auth.Auth) (code int, msg string, raw json.RawMessage, err error) {
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return 0, "", nil, err
 	}
@@ -102,7 +102,7 @@ func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCoun
 	if err != nil {
 		return nil, err
 	}
-	code, msg, raw, err := c.globalRegisterJSON(req)
+	code, msg, raw, err := c.globalRegisterJSON(req, a)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +157,7 @@ func (c *Client) GlobalRegisterStatus(a *auth.Auth) (activated bool, needsRegion
 		return false, false, "", err
 	}
 	req.Header.Set("X-User-Id", a.UID)
-	code, m, _, err := c.globalRegisterJSON(req)
+	code, m, _, err := c.globalRegisterJSON(req, a)
 	if err != nil {
 		return false, false, "", err
 	}
@@ -187,7 +187,7 @@ func (c *Client) GlobalSubmitRegion(a *auth.Auth, country GlobalCountry) error {
 	if err != nil {
 		return err
 	}
-	code, msg, _, err := c.globalRegisterJSON(req)
+	code, msg, _, err := c.globalRegisterJSON(req, a)
 	if err != nil {
 		return err
 	}

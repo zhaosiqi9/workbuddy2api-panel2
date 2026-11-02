@@ -20,7 +20,8 @@
     "request_archive_enabled": true,
     "request_retention_days": 7,
     "request_archive_max_mb": 100,
-    "request_client_info": true
+    "request_client_info": true,
+    "request_archive_context": false
   },
   "cooldown": {
     "soft_rate": "600s",
@@ -30,6 +31,7 @@
     "checkin_hours": [9, 21],
     "travel_hours": [9, 21],
     "activity_hours": [10],
+    "web_activity_enabled": false,
     "keepalive_hours": [22],
     "keepalive_refresh_window": "168h",
     "growth_hours": [11],
@@ -59,6 +61,7 @@
   },
   "upstream": {
     "timeout_seconds": 120,
+    "tls_fingerprint": "node",
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
     "user_agent": "",
@@ -91,7 +94,8 @@
   },
   "prompt": {
     "mode": "passthrough",
-    "file": ""
+    "file": "",
+    "keep_recent_rounds": 0
   },
   "upstash": {
     "url": "",
@@ -113,6 +117,7 @@
     "account_priority": {},
     "account_share": {},
     "cost_explore_interval": "30m",
+    "balance_window": "1h",
     "credit_floor": 100,
     "reserve_credits": 10,
     "model_fallback": {}

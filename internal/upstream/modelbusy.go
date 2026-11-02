@@ -88,7 +88,7 @@ func (c *Client) ModelBusy(a *auth.Auth, models []string) (map[string]string, er
 			req.Header.Set("X-User-Id", a.UID)
 		}
 		req.Header.Set("X-Domain", c.chatHost(a))
-		data, err := c.doJSON(req)
+		data, err := c.doJSON(req, a)
 		if err != nil {
 			var ue *Error
 			if c.globalOn(a) && errors.As(err, &ue) && ue.Kind == ErrNotFound {

@@ -48,7 +48,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(req, a)
 }
 
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
@@ -318,6 +318,6 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 	}
 	req.Header.Set("X-Domain", c.chatHost(a))
 	// 设备风控头：真机 /v2/report 不带 X-Device-Token（只有 billing 族带），故不注入。
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }

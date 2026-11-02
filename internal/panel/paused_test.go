@@ -115,6 +115,8 @@ assert.ok(start >= 0 && end > start, 'renderAccounts not found');
 const tb = { innerHTML: '' };
 const ctx = {
   String, Number, Math, Date, Object, Array, JSON, RegExp, console,
+  document: { activeElement: null },
+  accountProxyHTML: () => '',
   $: id => (id === 'accBody' ? tb : null),
   setHTML: (el, html) => { el.innerHTML = html; },
   esc: s => String(s == null ? '' : s), dur: () => '1m', ago: () => '刚刚',

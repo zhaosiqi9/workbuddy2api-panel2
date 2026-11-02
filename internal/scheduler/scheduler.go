@@ -55,6 +55,11 @@ type Config struct {
 	TravelDisabled bool
 	// ActivityDisabled 显式关闭活跃上报排程（schedule.activity_enabled=false）。
 	ActivityDisabled bool
+	// WebActivityDisabled 显式关闭国际版「网页通道」每日活跃腿（schedule.web_activity_enabled
+	// =false，缺省关）。issue #111 反馈实测：每日 30 积分只靠 /v2/report 就照常到账，
+	// 网页会话不是必要条件——而它每天要为每个国际号建一条真实会话、占一条活跃名额，
+	// 关掉时零上游调用。
+	WebActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
 	// GrowthDisabled 显式关闭成长任务队列排程（schedule.growth_enabled=false）。
@@ -183,11 +188,12 @@ type ScheduleParams struct {
 	KeepaliveHours []int
 	GrowthHours    []int
 
-	CheckinDisabled   bool
-	TravelDisabled    bool
-	ActivityDisabled  bool
-	KeepaliveDisabled bool
-	GrowthDisabled    bool
+	CheckinDisabled     bool
+	TravelDisabled      bool
+	ActivityDisabled    bool
+	WebActivityDisabled bool
+	KeepaliveDisabled   bool
+	GrowthDisabled      bool
 	// IncludeDisabledInTasks 保号类四任务是否覆盖禁用账号（见 Config 同名字段）。
 	IncludeDisabledInTasks bool
 
@@ -250,6 +256,7 @@ func (s *Scheduler) Reconfigure(p ScheduleParams) {
 	s.cfg.CheckinDisabled = p.CheckinDisabled
 	s.cfg.TravelDisabled = p.TravelDisabled
 	s.cfg.ActivityDisabled = p.ActivityDisabled
+	s.cfg.WebActivityDisabled = p.WebActivityDisabled
 	s.cfg.KeepaliveDisabled = p.KeepaliveDisabled
 	s.cfg.GrowthDisabled = p.GrowthDisabled
 	s.cfg.IncludeDisabledInTasks = p.IncludeDisabledInTasks
@@ -789,11 +796,14 @@ func (s *Scheduler) runActivity(ctx context.Context, spread bool) {
 		} else {
 			s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
 		}
-		// 国际版另有网页通道腿（issue #111）：上报只点亮连登，每日 30/50 积分认的是
-		// 「跑完的网页 agent 会话」。**放在上报之外**——上报偶发失败不该连带丢掉当日
-		// 积分（两条腿在上游是各自独立的判据）。国内版在 runWebActivityLeg 内部
-		// 按 IsGlobal 直接返回，零上游调用。
-		s.runWebActivityLeg(ctx, a)
+		// 国际版另有网页通道腿（issue #111）：默认关（WebActivityDisabled）。上游实测
+		// 每日 30 积分的判据是活跃上报本身，网页会话不是必要条件（对照号从没跑过会话
+		// 照样 +30），而这条腿每天要为每个国际号建一条真实会话、占一条活跃名额
+		// （上限 10，漏收尾就永久少一条）。需要时用 schedule.web_activity_enabled=true
+		// 打开；国内号在 runWebActivityLeg 内部按 IsGlobal 直接返回，零上游调用。
+		if !s.cfg.WebActivityDisabled {
+			s.runWebActivityLeg(ctx, a)
+		}
 	}
 }
 

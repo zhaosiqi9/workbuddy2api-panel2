@@ -23,6 +23,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/prompt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
@@ -105,6 +106,11 @@ type Config struct {
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
 
+	// RecordContext 是否把会话上下文（system + messages）记入请求事件。
+	// 来自 logging.request_archive_context（缺省 false）：提示词是用户数据，
+	// 默认不落盘。热生效，经 livecfg 快照。
+	RecordContext bool
+
 	// EmbeddingsEnabled 实验特性 /v1/embeddings 开关的静态回退（features.embeddings_enabled）。
 	// Live 非 nil 时以热快照为准；裸用/单测路径用本字段。
 	EmbeddingsEnabled bool
@@ -122,6 +128,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		SoftCooldown:      h.cfg.SoftCooldown,
 		EmbeddingsEnabled: h.cfg.EmbeddingsEnabled,
 		RecordClientInfo:  h.cfg.RecordClientInfo,
+		RecordContext:     h.cfg.RecordContext,
 		HiddenModels:      livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
 		AllowedModels:     allowed,
 		AllowlistEnabled:  enabled,
@@ -596,6 +603,10 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			h.declareReasoning(entry, "cn", mi.ID, efforts)
 		}
+		// models.dev 形状的能力声明（modalities/limit/tool_call/reasoning/
+		// reasoning_options）：纯追加，原有字段一个不动；给只认 models.dev 词表的
+		// 下游（magpie 等）一份读得懂的声明。同源派生见 applyModelsDevShape 注释。
+		applyModelsDevShape(entry, mi, efforts, false)
 		out = append(out, entry)
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
@@ -652,6 +663,11 @@ func (h *Handler) modelList() []map[string]any {
 				}
 				h.declareReasoning(entry, "global", id, efforts)
 			}
+			// models.dev 形状与 CN 分支同口径；hasInfo=false 时连能力字段都没有，
+			// 不追加（按裸 ID 输出，不编造）。
+			if hasInfo {
+				applyModelsDevShape(entry, info, efforts, false)
+			}
 			out = append(out, entry)
 		}
 	}
@@ -694,7 +710,11 @@ func (h *Handler) generationModelEntries() []map[string]any {
 				"owned_by":         "workbuddy",
 				"image_generation": true,
 			}
-			out = append(out, applyModelInfoFields(entry, mi))
+			entry = applyModelInfoFields(entry, mi)
+			// 出图模型：modalities.output = ["image"]（没有上下文/输出，limit 自然省略）。
+			// 与对话模型同一份函数，保证两处字段形状一致。
+			applyModelsDevShape(entry, mi, nil, true)
+			out = append(out, entry)
 		}
 	}
 	return out
@@ -811,6 +831,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+	// 会话上下文（面板「请求事件日志」展开看）：/messages 与 /responses 都先转成
+	// chat 体再进来，所以这一处就覆盖三条入站协议。开关关时为零值 nil，不落盘。
+	if h.loadLive().RecordContext {
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.context = archiveContext(body)
+		}
+	}
 
 	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本（见
 	// upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」与
@@ -870,7 +897,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if m == nil {
 			return ""
 		}
-		to := m[curModel]
+		// 键查找：先试当前域前缀键（"cn:x"/"global:x"，只在该域生效），再回退裸名键
+		// （两域共用）。配置端原样透传不做归一化（与 models.aliases 不同），带前缀的
+		// 键必须由查找端解析 —— 只查裸名会让前缀键整表失效，而 Config.ModelFallback
+		// 的注释与面板都承诺「裸名或带域前缀均可」（2026-10-25 实案：config.json 写
+		// {"global:deepseek-v4.1-flash": "..."}，global 域 6004 后完全没有降级）。
+		to := m[realm+":"+curModel]
+		if to == "" {
+			to = m[curModel]
+		}
 		if to == "" || to == curModel || fallbackTried[to] || !h.allowedModel(realm, to) || h.hiddenModel(realm, to) {
 			return ""
 		}
@@ -911,6 +946,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+		// request_id 也要同步：此前只有 images 路径设过，chat 行因此永远缺
+		// `rid= | out= | try= | credit= ` 这一段 —— 上游末帧 usage.credit（本次真实
+		// 扣费）与付费/免费判断在流水里完全看不到，只能翻归档对 rid。
+		st.requestID = tr.id
 	}
 	defer st.done()
 
@@ -1266,6 +1305,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						logfmt.Label(acct.UID, acct.Nickname))
 				} else {
 					lastErr = err
+					if proxypool.IsError(err) {
+						break
+					}
 					if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 						h.cfg.Pool.Disable(acct.UID, "refresh session dead")
 					} else {
@@ -1305,6 +1347,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
+			if proxypool.IsError(terr) {
+				break
+			}
 			// 客户端已断连（人走了）例外：传输错误是断连的**结果**，不是这个号的
 			// 错——喂连败会把每次断连都记到当时被选中的号上，几次之后整池逐个被
 			// 降权、且边降边被后续重试刷新，表现为「账号永远解不了封」；换号也只是
@@ -1469,6 +1514,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				// 6020 带 data.retry_after（实测 40s、position 2502）时不再换号：上游已给出
+				// 「N 秒后重试」的通道级口径，在这几毫秒内换号必然撞同一堵墙，只是把同一份
+				// 排队请求多发几次（issue #125；embeddings 链路早已同口径 fail-fast）。
+				// 6021（队列满、无 retry_after）保留轮转：那是间歇空窗，换号有机会碰上。
+				if uerr.RetryAfter > 0 {
+					break
+				}
 				if !rotateBackoff(i, r.Context()) {
 					break // ctx 取消：终止轮转（排队满载换号退避）
 				}
@@ -1939,6 +1991,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		status = http.StatusBadRequest
 	}
+	if proxypool.IsError(lastErr) {
+		status, code, msg, hint = http.StatusServiceUnavailable, "proxy_unavailable", lastErr.Error(), ""
+		retryAfterSec, quotaCode, quota = 0, 0, false
+	}
 	if retryAfterSec > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
 	}
@@ -2376,6 +2432,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 账号临时出池（NoteFailures 达阈降权），单次/偶发不罚（不误伤）。ErrNone
 		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
 		if kind == upstream.ErrClient {
+			// 15021 = edgebrowser 的**域名路由策略**拒绝（"domain rejected by via
+			// routing policy"）：域名级判定，同一域名的所有账号返回完全一致的 403，
+			// 与账号健康无关。喂连败会让「连续抓几个 Google 文档」把整个 CN 池逐个
+			// 降到出池（5 次达阈）——这不是账号的问题，故与 ErrContentBlocked 同待遇：
+			// 零动作（/v1/fetch 另有跨域兜底，见 fetch.go）。
+			if upstream.HasCodeMarker(body, "15021") {
+				return
+			}
 			h.cfg.Pool.NoteFailures(uid)
 		}
 	}

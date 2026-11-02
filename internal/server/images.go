@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
@@ -82,6 +83,12 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
+	}
+	// 出图也有「上下文」（prompt，编辑还有原图）：同一开关，同一处归档。
+	if h.loadLive().RecordContext {
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.context = archiveContext(raw)
+		}
 	}
 	prompt, _ := req["prompt"].(string)
 	if strings.TrimSpace(prompt) == "" {
@@ -161,6 +168,9 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		}
 		if err != nil {
 			lastErr = err
+			if proxypool.IsError(err) {
+				break
+			}
 			var ue *upstream.Error
 			if errors.As(err, &ue) {
 				// 与 chat 同一套失败处置（冷却/熔断/模型负缓存/12153 计数）。
@@ -192,6 +202,8 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 	status, code := http.StatusBadGateway, "upstream_error"
 	var ue *upstream.Error
 	switch {
+	case proxypool.IsError(lastErr):
+		status, code = http.StatusServiceUnavailable, "proxy_unavailable"
 	case len(tried) == 0: // 一个可用账号都没有：没有可重试的对象，明确说清楚
 		status, code = http.StatusServiceUnavailable, "no_account"
 		lastErr = fmt.Errorf("没有可用的 %s 账号（图像只在 %s 域出图）", realm, realm)

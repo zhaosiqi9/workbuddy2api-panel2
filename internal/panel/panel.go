@@ -30,6 +30,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
 	"github.com/misakano7545/workbuddy2api-panel/internal/updater"
@@ -40,6 +41,7 @@ import (
 // Config 面板依赖（main 装配注入）。
 type Config struct {
 	Pool      *pool.Pool
+	ProxyPool *proxypool.Manager
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	// AutoTasksEnabled 与成长任务开关共用热配置；nil 时只允许手动启动后台任务。
@@ -94,10 +96,11 @@ type Config struct {
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
 // 本 mux 的 pattern 均带 /panel 前缀（外层不做前缀剥离）。
 type Panel struct {
-	cfg     Config
-	mux     *http.ServeMux
-	started time.Time
-	logs    *Ring
+	proxyAccountMu sync.Mutex
+	cfg            Config
+	mux            *http.ServeMux
+	started        time.Time
+	logs           *Ring
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -232,6 +235,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.proxyRoutes()
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/error_summary", p.withAuth(p.errorSummary))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
@@ -366,6 +370,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 模型降级路由表：前端据它标注「⤳ 已路由至 X」（限流的模型若配了等价模型）。
 		"model_fallback": p.modelFallbackSnapshot(),
 		"accounts":       p.cfg.Pool.List(),
+		"proxy_pool":     p.proxySnapshot(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久，移植上游
 		// PR #120）：与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -405,11 +410,29 @@ func (p *Panel) updateSnapshot() any {
 // ?since=<RFC3339> 时只返回**该时刻之后**的条目（增量拉取）。面板「运行日志」页
 // 每 5 秒拉一次全量（500 行，~90KB），绝大多数轮次这 500 行根本没变。
 //
+// 增量优先认 ?since_seq=<uint64>（只回 Seq 更大的条目）——这是**唯一可靠**的游标：
+// TS 在同一时钟刻度内的多次写入完全相同（Windows 实测 ~15.6ms 粒度，一次 Write
+// 的多行 + 背靠背的多次 Write 都会撞），按 TS 过滤必然要么重复、要么整批漏掉。
+// 连「带纳秒的原始 TS 串」也救不了同一刻度内的多条。
+//
+// ?since 保留兼容（旧前端 / 手工 curl），语义仍是「TS 严格晚于 since」。
+//
 // 语义与全量一致：响应仍是 {entries, archive_error}，前端把新条目追加到已有列表。
 // 游标过期时客户端自己做一次全量拉（环形缓冲淘汰最旧行时，被淘汰的行不会再来）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	entries := p.logs.Snapshot()
-	if raw := r.URL.Query().Get("since"); raw != "" {
+	q := r.URL.Query()
+	if raw := q.Get("since_seq"); raw != "" {
+		if since, ok := parseSeqParam(raw); ok {
+			filtered := entries[:0:0] // 新切片：不改 Snapshot 返回的底层数组
+			for _, e := range entries {
+				if e.Seq > since {
+					filtered = append(filtered, e)
+				}
+			}
+			entries = filtered
+		}
+	} else if raw := q.Get("since"); raw != "" {
 		if since, ok := parseSinceParam(raw); ok {
 			filtered := entries[:0:0] // 新切片：不改 Snapshot 返回的底层数组
 			for _, e := range entries {
@@ -421,6 +444,19 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "archive_error": p.logs.ArchiveError()})
+}
+
+// parseSeqParam 解析 ?since_seq=。
+//
+// 非法值回落全量（与 parseSinceParam 同口径：宁可多给不可少给）。
+// seq 初值是启动时刻的毫秒数（见 NewRing），远大于 0，故 since_seq=0 等价于
+// 全量——正是首次加载想要的语义。
+func parseSeqParam(raw string) (uint64, bool) {
+	v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // parseSinceParam 解析 ?since= 参数。
@@ -1102,7 +1138,19 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
+	p.proxyAccountMu.Lock()
+	defer p.proxyAccountMu.Unlock()
 	uid := r.PathValue("uid")
+	if p.cfg.Pool.AuthByUID(uid) == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if p.cfg.ProxyPool != nil {
+		if err := p.cfg.ProxyPool.Unbind(uid); err != nil {
+			writeErr(w, http.StatusInternalServerError, "save account proxy binding failed")
+			return
+		}
+	}
 	a := p.cfg.Pool.Remove(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")

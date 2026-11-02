@@ -126,20 +126,20 @@ func TestCodeSemantics(t *testing.T) {
 }
 
 // TestDecorateAuthURL 覆盖授权链接参数补齐（对齐官方 appendAuthUrlParams）：
-// 每个站点都补 version；ww_device_nonce 只对 platform=workbuddy 的站点且 nonce
-// 非空时补——按官方口径，platform=workbuddy 的正是国内桌面端（CN 站）。
+// 不发 version（授权页 bundle 从不读它）；ww_device_nonce 只对 platform=workbuddy
+// 的站点且 nonce 非空时补——按官方口径，platform=workbuddy 的正是国内桌面端（CN 站）。
 func TestDecorateAuthURL(t *testing.T) {
 	const base = "https://example.com/login?platform=CLI&state=abc"
 
-	// 所有站点都补 version，原有参数（含 URL 自带的 platform）一律不动。
+	// 不发 version；原有参数（含 URL 自带的 platform）一律不动。
 	for _, id := range []string{SiteCN, SiteIntl, SiteWorkBuddy} {
 		got := DecorateAuthURL(base, For(id), "")
 		u, err := url.Parse(got)
 		if err != nil {
 			t.Fatalf("%s: parse %q: %v", id, got, err)
 		}
-		if v := u.Query().Get("version"); v != ClientVersion {
-			t.Errorf("%s version=%q want %q", id, v, ClientVersion)
+		if v := u.Query().Get("version"); v != "" {
+			t.Errorf("%s 不该补 version，得到 %q", id, v)
 		}
 		// 原有参数不得丢。
 		if s := u.Query().Get("state"); s != "abc" {

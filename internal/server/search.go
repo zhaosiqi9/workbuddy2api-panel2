@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
@@ -165,6 +166,9 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lastErr = err
+		if proxypool.IsError(err) {
+			break
+		}
 		var ue *upstream.Error
 		if errors.As(err, &ue) {
 			// 与 chat/images 同一套失败处置（冷却/熔断/模型负缓存/12153 计数）。
@@ -190,6 +194,8 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 	status, code := http.StatusBadGateway, "upstream_error"
 	var ue *upstream.Error
 	switch {
+	case proxypool.IsError(lastErr):
+		status, code = http.StatusServiceUnavailable, "proxy_unavailable"
 	case len(tried) == 0:
 		status, code = http.StatusServiceUnavailable, "no_account"
 		lastErr = fmt.Errorf("没有可用的 %s 账号", realm)
