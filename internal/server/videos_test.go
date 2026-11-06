@@ -249,7 +249,8 @@ func TestVideosSyncWaitsForCompletion(t *testing.T) {
 	if u, _ := videos[0].(map[string]any)["url"].(string); u != "https://cos.example/v.mp4?sig=x" {
 		t.Fatalf("成品 URL 不对：%v", videos[0])
 	}
-	if got["size"] != "768P" || got["seconds"] != float64(4) {
+	// seconds 按 OpenAI Videos 定义成字符串（不是数字）。
+	if got["size"] != "768P" || got["seconds"] != "4" {
 		t.Fatalf("size/seconds 应透出：%v", got)
 	}
 	usage, _ := got["usage"].(map[string]any)
@@ -332,7 +333,7 @@ func TestVideosMissingPrompt(t *testing.T) {
 	}
 }
 
-// TestVideosUnknownTask 查不存在的任务：每个可用账号试一次，最终 404 + 可操作 hint。
+// TestVideosUnknownTask 查不存在的任务：有界探测（账号数不超过上限时问遍），最终 404 + 可操作 hint。
 func TestVideosUnknownTask(t *testing.T) {
 	f := &videoFake{on: func(c videoCall) (int, string) {
 		return 404, `{"code":404,"msg":"task not found"}`
@@ -367,11 +368,11 @@ func TestVideosTaskLedger(t *testing.T) {
 	if s.claimCharge("t1") {
 		t.Fatal("第二次 claimCharge 必须失败（防重复记账）")
 	}
-	s.adopt("t2", "g1", "global", "kling-video-v3")
+	s.adopt("t2", "g1", "global", "kling-video-v3", false)
 	if o, ok := s.get("t2"); !ok || o.UID != "g1" {
 		t.Fatalf("adopt 没写进台账：%+v ok=%v", o, ok)
 	}
-	s.adopt("t2", "c9", "cn", "x") // 已存在就不覆盖（收养只补缺）
+	s.adopt("t2", "c9", "cn", "x", false) // 已存在就不覆盖（收养只补缺）
 	if o, _ := s.get("t2"); o.UID != "g1" {
 		t.Fatalf("adopt 覆盖了已有条目：%+v", o)
 	}
@@ -469,7 +470,7 @@ func TestVideoRepeatPollKeepsUsage(t *testing.T) {
 	if use2 == nil || use2["credit"] != 57.14 {
 		t.Fatalf("重复查询仍应带 credit（上游这次没回 usage）：%v", second)
 	}
-	if second["size"] != "768P" || second["seconds"] != float64(4) {
+	if second["size"] != "768P" || second["seconds"] != "4" {
 		t.Fatalf("重复查询应从台账补齐 size/seconds：%v", second)
 	}
 	// 只该记一次账

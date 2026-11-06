@@ -231,9 +231,11 @@ type Handler struct {
 	taskMu      sync.Mutex
 	taskRunning map[string]bool
 	// videos 视频任务台账：上游任务只对提交它的账号可见，查询必须回到同一账号；
-	// 进程内（重启清空，查询时按账号逐个试自愈），见 videos.go 文件头。
+	// 进程内（重启清空，查询时有界探测自愈），见 videos.go 文件头。
 	videoLedger *videoTaskStore
-	budget      *dailyBudget
+	// videoProbe 台账里没有的任务的探测状态（负缓存 / 全局限速 / 暂停），见 videos_probe.go。
+	videoProbe videoProber
+	budget     *dailyBudget
 }
 
 // NewHandler 构建 handler。
@@ -267,8 +269,12 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(func(w http.ResponseWriter, r *http.Request) { h.images(w, r, true) }))
 	// 视频生成：上游 /v2/videos/* 是异步任务，网关拆成「提交 / 查任务」两个入口
 	// （同步等待由 wait / timeout_seconds 控制），见 videos.go 文件头。
+	// POST /v1/videos 与 GET /v1/videos/{id}/content 是 OpenAI Videos 资源的标准路径，
+	// 与下面三条自解释路径共用同一份实现（OpenAI 那套已于 2026-09-24 关停，形状仍在 SDK 里）。
+	h.mux.HandleFunc("POST /v1/videos", h.withAuth(h.videos))
 	h.mux.HandleFunc("POST /v1/videos/generations", h.withAuth(h.videos))
 	h.mux.HandleFunc("POST /v1/videos/tasks", h.withAuth(h.videoTasks))
+	h.mux.HandleFunc("GET /v1/videos/{task_id}/content", h.withAuth(h.videoContent))
 	h.mux.HandleFunc("GET /v1/videos/{task_id}", h.withAuth(h.videoTask))
 	// MCP（Streamable HTTP 子集，JSON-RPC 2.0）：把本网关的媒体能力做成工具面，见 mcp.go。
 	h.mux.HandleFunc("POST /mcp", h.withAuth(h.mcpPost))
@@ -876,16 +882,30 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	return dynamicModelsCache.ids
 }
 
+// admitBudget 过积分闸，拒绝时已写出错误响应并返回 false。chatCompletions 与「出图先于
+// 对话」的 Responses 入口共用，两处的拒绝形状必须一致。
+func (h *Handler) admitBudget(w http.ResponseWriter) bool {
+	ok, why := h.budget.admit()
+	if ok {
+		return true
+	}
+	used, limit, _, _ := h.budget.snapshot()
+	code, msg := "daily_budget_exceeded", fmt.Sprintf(
+		"daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit)
+	if why != "" {
+		// 快速闸的拒因自带可读说明，别和「当日用光」混成一句话
+		code, msg = "credit_guard_tripped", why
+	}
+	writeOpenAIError(w, http.StatusTooManyRequests, code, msg)
+	return false
+}
+
+// budgetAdmittedKey 上游入口（/v1/responses 的托管出图）已经过了积分闸：同一请求后面的对话环节不再判。
+// 否则出图入账后累计越过上限，对话一步就会被拒——图扣了钱却交不出去。代价是最多超支一次对话。
+type budgetAdmittedKey struct{}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	if ok, why := h.budget.admit(); !ok {
-		used, limit, _, _ := h.budget.snapshot()
-		code, msg := "daily_budget_exceeded", fmt.Sprintf(
-			"daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit)
-		if why != "" {
-			// 快速闸的拒因自带可读说明，别和「当日用光」混成一句话
-			code, msg = "credit_guard_tripped", why
-		}
-		writeOpenAIError(w, http.StatusTooManyRequests, code, msg)
+	if admitted, _ := r.Context().Value(budgetAdmittedKey{}).(bool); !admitted && !h.admitBudget(w) {
 		return
 	}
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
