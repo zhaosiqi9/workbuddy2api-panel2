@@ -330,6 +330,55 @@ HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`so
 
 成长中心连登档位（连续登录 7/14/28 天）兑换后发放积分 / 能量 / 补签卡 / **抽奖次数**，抽奖次数只能从兑换获得。网关把它挂在每日签到排程末尾自动跑闭环（见[定时任务](#定时任务)）：档位解锁当天自动兑换、有抽奖次数自动抽完，全程无需人工盯。
 
+## 🪟 Windows 常驻运行（开机自启 + 崩溃重启）
+
+二进制**不自带守护**：进程退出后不会自己回来，也没有内置服务（SCM）模式。把面板当本地网关用时（上游客户端写死 `127.0.0.1:<端口>`），进程不在等于该 provider 整体不可用——客户端立刻拿到 `connection refused`，不会重试。所以「开机自启 + 退出即重启」得由系统侧提供，下面两种任选一种。
+
+先确认三件事：`wb2api.exe` 的绝对路径（工作目录就是放 `config.json` 的地方）；配置里 `listen` 默认只绑 `127.0.0.1`，不用额外放通防火墙；手动跑一次能起（首次会自动生成含随机 `api_key` 的 `config.json`），再交给常驻项。
+
+### 方案 A：NSSM（推荐，真正的服务）
+
+NSSM 按「进程退出」拉起，不看退出码——面板无论因何退出都会回来，日志也一起接管：
+
+```powershell
+nssm install wb2api-panel 'C:\wb2api\wb2api.exe'
+nssm set wb2api-panel AppDirectory 'C:\wb2api'
+nssm set wb2api-panel Start SERVICE_AUTO_START
+nssm set wb2api-panel AppExit Default Restart
+nssm set wb2api-panel AppStdout 'C:\wb2api\service.log'
+nssm set wb2api-panel AppStderr 'C:\wb2api\service.log'
+nssm start wb2api-panel
+```
+
+WinSW 同理（`<startmode>Automatic</startmode>` + `<onfailure action="restart"/>`），不另举例。
+
+### 方案 B：任务计划程序（系统自带，不需要装东西）
+
+管理员 PowerShell 执行，把路径换掉：
+
+```powershell
+$exe = 'C:\wb2api\wb2api.exe'
+$act = New-ScheduledTaskAction -Execute $exe -WorkingDirectory (Split-Path $exe)
+$trg = New-ScheduledTaskTrigger -AtStartup
+$set = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+       -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName 'wb2api-panel' -Action $act -Trigger $trg -Settings $set -RunLevel Highest
+Start-ScheduledTask -TaskName 'wb2api-panel'
+```
+
+两个坑：
+- `-ExecutionTimeLimit 0`：默认任务跑满 3 天会被结束掉，常驻进程必须关掉这个限制；
+- 这里的「失败后重启」**只对非零退出码生效**——进程自己正常退出（码 0）或被人 `taskkill` 掉，任务不会重来。所以要做到「任何原因退出都拉起」，用方案 A。
+
+### 更新时的注意事项
+
+「一键更新」的设计是**先停旧进程 → 换二进制 → 起新进程**，中间有几秒端口空窗，这期间的请求会失败一次（客户端一般不重试）。两件事别忘：
+
+1. 常驻项若在旧进程退出后立刻拉起，可能抢在 updater 起新进程之前占住端口——更新完确认只有一个进程在跑：`Get-Process wb2api` 与 `netstat -ano | findstr :7863` 的 PID 要对得上；
+2. 更新前后各打一次 `curl http://127.0.0.1:7863/healthz`，确认新进程确实起来了（面板右下角也会显示版本号）。
+
+> 内置服务模式（`wb2api.exe install-service` 走 SCM）没有做：更新重启要连带重写服务控制逻辑，且 CI 只有 Linux 构建机，Windows 服务生命周期没法做回归。用上面两种效果等价。
+
 ## 🆚 与上游的差异
 
 本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
@@ -359,6 +408,8 @@ HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`so
 | **模型能力透出** | `/v1/models` 附带 `context_length` / `max_output_tokens` / 工具·视觉·思考能力标记 / 积分倍率等上游真实字段，并声明 `reasoning_supported_efforts` / `reasoning_default_effort`：默认档按 `thinking.*` 策略写成网关**实际生效档**（策略关闭时忠于上游），`can_disable_thinking` 的模型在档位表里追加 `off`，目录只给固定档的模型声明为单档 |
 | **models.dev 形状能力声明** | 上一条之外，`/v1/models` 每条再**追加**一组 models.dev 词表字段，给只认这套词的客户端（magpie 等）读：`modalities`（`input` 按 `supports_images` 给 `["text"]` 或 `["text","image"]`；`output` 对话模型恒 `["text"]`、出图模型 `["image"]`）、`limit`（`context`/`output` 直接搬同一轮的 `context_length`/`max_output_tokens`，缺哪个省哪个，**不拿 1M/131072 兜底**）、`tool_call`、`reasoning`、`reasoning_options`（档位取 `reasoning_supported_efforts` 去掉 `off`；有 `off` 或 `can_disable_thinking` 时补 `{"type":"toggle"}`）。**纯追加**：既有键一个字节都不改（`cn:` 前缀、`object`、`created`、`owned_by` 照旧），无数据源的字段（`cost`/`attachment`/`structured_output`/`knowledge`/`release_date`）一律不写——客户端按「字段在不在」判能力，编造比缺失更糟。另加 `supported_reasoning_levels`（`[{"effort":"low"},…]`）：**这是本组里唯一不属于 models.dev 词表的键**，因为 magpie 解析厂商列表时只认它（`internal/catalog/live.go:704` 的 `liveModel.Levels`），「关闭思考」按其 `EffortRank` 写成 `none` 而不是 `off`，出图与无档位模型整键不写。不认这些键的客户端按 JSON 惯例忽略。面板自己的 `/panel/api/models` 不受影响，仍是网关形状 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
+| **入站请求体上限（OOM 护栏）** | `server.max_payload_bytes`（默认 64 MiB，允许 8–512 MiB）：读体是 `io.ReadAll` 无界的，一次几百 MB 的上传就能把网关连同伴生面板一起 OOM。超限**先排空有限字节再回** `413 payload_too_large`（不排空则 net/http 关连接，客户端只看到 connection reset）；OpenAI / Anthropic 两种入口各回各自形状。上限刻意远高于真实会话（多图长会话实测几 MB 量级），**不做大请求预拦截**——8 MiB 那种紧上限曾因多图长会话被移除 |
+| **11140 风控连坐保护** | 11140 的两种形态都认（英文 `request illegal` / 中文「账号存在异常行为，已被限制使用」与 `unusual activity`；**code + 文案必须同时成立**，否则会把同 code 的模型级限流误判成账号终态）。命中**就地停手、不换号**——原来的「禁用该号 + 立刻换下一个」会让一个请求顺着轮转把整池账号逐个送进风控；同一 15 分钟窗内 ≥2 个不同账号被限制 → 全池暂停派发 `upstream.restriction_hold_seconds`（默认 1800s；0 = 只停手不暂停），期间 `503 account_restricted_hold` + `Retry-After` |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖，见下文） |
 | **零输出守卫** | 上游「收下请求却零输出」（HTTP 200 + `finish_reason=length` + 正文/思考/工具全空，典型成因：输入越过模型**真实**窗口，声明的 `context_length` 被虚报）此前被当成一次成功：客户端拿到空正文，网关零日志零计数，下一次照旧挑同一个号撞同一面墙。现在流式在**写出第一个字节之前**判出来（首帧否决窗口延长到首个**可见输出**帧，role 帧不提交响应头）→ 换号重发一次，客户端完全无痕；非流式在聚合体上判定，同样重发一次。全池都撞则如实回 `502 zero_output_length` + 可行动 hint（缩短输入 / 调大 `max_tokens`），**不罚账号、不冷却**（这是请求形态问题，不是账号健康问题） |
