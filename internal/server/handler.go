@@ -912,6 +912,12 @@ func (h *Handler) admitBudget(w http.ResponseWriter) bool {
 // 否则出图入账后累计越过上限，对话一步就会被拒——图扣了钱却交不出去。代价是最多超支一次对话。
 type budgetAdmittedKey struct{}
 
+// 模型降级后的「实际模型」按**线协议原值**记：to 就是 applyFallback 写进出站 body 的
+// 那个字符串（带不带域前缀都以它为准）。不要在这里自造 realm 前缀——请求侧的 st.model 取
+// 客户端/别名解析后的原值（通常是裸名），单边补前缀会让流水行与面板变成
+// 「deepseek-v4.1-flash->cn:deepseek-v4-flash」这种两端对不上的写法；域前缀在模型目录、
+// 模型锁、请求记录里本来就另有各存的字段，不属于 model_eff 的职责。
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if admitted, _ := r.Context().Value(budgetAdmittedKey{}).(bool); !admitted && !h.admitBudget(w) {
 		return
@@ -1337,6 +1343,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if to := fallbackTo(); to != "" {
 				log.Printf("model fallback: %s -> %s (no account for model, 6004 blocked)", curModel, to)
 				if applyFallback(to) {
+					st.modelEff = to
 					continue
 				}
 			}
@@ -1506,6 +1513,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 					savedBare := bareModel
 					if applyFallback(to) {
+						st.modelEff = to
 						// 同账号重试：把该账号从 tried 移除（降级是「换模型」不是「换号」，
 						// 同一账号仍应有机会），并让 sticky 保持（本请求内不重绑）。
 						delete(tried, acct.UID)
@@ -1625,7 +1633,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 原状态，让下游用自己的重试策略消化排队。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				// 只释放租约，**不解绑会话粘性**：这是上游容量信号（账号无过错），换号会
+				// 丢掉账号级前缀缓存（issue #188：同号命中 97–99%、换号 0–12%）。保留绑定 →
+				// 客户端按 Retry-After 重试时仍回同一个号，缓存不重建；真换了号成功，
+				// 下方成功分支会用 Bind 覆盖旧绑定，粘性照样跟随。
+				releaseHeld()
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 				// 6020 带 data.retry_after（实测 40s、position 2502）时不再换号：上游已给出
 				// 「N 秒后重试」的通道级口径，在这几毫秒内换号必然撞同一堵墙，只是把同一份
@@ -1723,7 +1735,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 截断自动续写（见 continue.go）：上游 finish_reason=length 且为纯文本/推理
 			// 段时，同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流。
 			// 显式限额 / 工具参数截断 / 续写请求失败 → 自动降级为今天的截断终态。
-			cont := newContinueReader(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc)
+			// 本轮生效档位对应的输出预算下限：续写/救援段从原始 body 重建，靠它把
+			// max_tokens 补回可用值（见 upstream.MinOutputBudget 的说明）。
+			cont := newContinueReaderWithFloor(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc,
+				upstream.MinOutputBudget(hopTiming.Effort))
 			defer cont.Close()
 			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
@@ -1736,7 +1751,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			repair := upstream.NewMarkupRepair(declaredTools, true)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithMarkupRepair(repair), upstream.WithModelEcho(modelEcho))
+			}), upstream.WithMarkupRepair(repair), upstream.WithModelEcho(modelEcho),
+				// 客户端已断开时上游只是被动跟随，别把断流记成上游故障（日志归因）。
+				upstream.WithClientGoneFn(func() bool { return r.Context().Err() != nil }))
 			// 首帧否决（见 upstream.HeadVetoError）：网关一个字节都没写出，这次尝试对
 			// 客户端完全无痕——按错误类型处置账号后换号，而不是把「HTTP 200 + error 帧」
 			// 透给客户端（SSE 发过字节就改不了状态码，此前只能这么兜底）。
@@ -1821,6 +1838,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("INFO: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (本轮无工具调用，正常收尾)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools))
 			}
+			// 正文截断留痕：finish_reason=length 表示上游在输出额度处切断了这一轮。
+			// 此前 reqlog 不记 finish_reason、日志也没有任何 length 行，「回答写到一半
+			// 就停了」在运维侧完全不可见（只能靠猜）。这里落一行可计数的 WARN（进
+			// 错误汇总），带用量与「客户端是否自带限额」——一眼分清「客户端额度太小」
+			// 与「思考吃光同一份额度」（后者是 cn:deepseek 系的真实高频成因）。
+			if stats.FinishReason() == "length" && !stats.SawToolCalls() {
+				ct, hasCT := stats.Tokens()
+				th, hasTh := stats.Thinking()
+				log.Printf("WARN: [server] stream acct=%s model=%s: finish_reason=length 正文截断（tok=%d think=%d hasTok=%v hasThink=%v 客户端限额=%v）——输出额度用尽，上游在此处切断",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, ct, th, hasCT, hasTh, bodyHasOutputLimit(body))
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1873,7 +1901,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 空截断救援（见 starved.go）：额度被思考吃光、正文零字节。非流式这一侧
 		// 没有 continueReader，救援在这里做——同预算关思考重发一次、重新聚合。
 		if aggregateStarved(resp) && bodyHasOutputLimit(body) {
-			if rb, ok := starvedRetryBody(body); ok {
+			if rb, ok := starvedRetryBodyWithFloor(body, upstream.MinOutputBudget(hopTiming.Effort)); ok {
 				if rc2, st2, _, e2 := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, rb, clientIP, chatMeta, nil); e2 == nil && st2 < 400 && rc2 != nil {
 					if resp2, e3 := upstream.Aggregate(rc2); e3 == nil {
 						rc2.Close()

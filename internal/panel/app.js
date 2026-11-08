@@ -1133,7 +1133,11 @@ async function loadModels(force) {
     // 目录来源：桌面端族是官方 picker 口径；union/enterprise 说明 v3 探测部分或全部失败，
     // 拿到的是回落目录（数量偏少、倍率可能是旧值），必须在界面上说清楚。
     const srcNote = { 'v3-desktop': '', 'v3-union': ' · ⚠ 国际版目录来自回落（IDE+CLI 并集）', 'enterprise': ' · ⚠ 国际版目录已降级到企业端点（窄目录/旧倍率）' }[d.global_source] || '';
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote;
+    // 分域取数失败告警（fetch_errors，2026-10-25）：此前某域失败被后端静默吞掉——
+    // global 探测失败（如 DNS 抖动 → 5min 负缓存）时页面只剩 CN 模型，无从知道原因。
+    const errs = Array.isArray(d.fetch_errors) ? d.fetch_errors.filter(Boolean) : [];
+    const errNote = errs.length ? ' · ⚠ ' + errs.join('；') : '';
+    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote + errNote;
     renderModels();
     refreshEffortDowngradeNote(); // 模型目录到位后才知道哪些档位会降级
   } catch (e) {
@@ -1232,7 +1236,12 @@ function mdAvailabilityOf(m, locks, recent) {
     return { key: 'limited', label: '限流/不可用', cls: 'warn',
       tip: '模型级冷却中' + (reason ? '；' + reason : '') };
   }
-  const ev = recent.find(e => e && e.model === id);
+  // 同时匹配请求模型与降级后实际模型（model_eff）：请求 A 实际用 B 成功时，
+  // B 的「可用」标注也要由这条真实流量合成（2026-10-25 链路补齐）。
+  // model_eff 记的是出站线协议原值（通常是裸名），而这里的 id 带域前缀，
+  // 两种形态都要认——只比 id 会让 global 域的降级流量完全命中不了。
+  const ev = recent.find(e => e && (e.model === id || e.model === bare ||
+    e.model_eff === id || e.model_eff === bare));
   if (ev) {
     const status = Number(ev.status || 0);
     const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
@@ -1648,7 +1657,7 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.model_eff, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -1678,6 +1687,15 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
+/* reqModelText 请求记录模型列：请求模型与降级后实际模型是两个不同模型（计价/能力
+   都不同，2026-10-25 实案），显示成 requested->effective；未降级保持单值旧格式。 */
+function reqModelText(e) {
+  const m = e && e.model;
+  const eff = e && e.model_eff;
+  if (!m) return '—';
+  return eff && eff !== m ? m + '->' + eff : m;
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
@@ -1692,7 +1710,7 @@ function renderRequestTable() {
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
-      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + esc(reqModelText(e)) + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -1748,6 +1766,7 @@ function requestLogText(e) {
     when,
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
+    (e && e.model_eff && e.model_eff !== e.model) ? '⤳ ' + e.model_eff : '',
     e && e.account || '—',
     e && e.client_ip || '—',
     e && e.user_agent || '—',
@@ -3885,20 +3904,31 @@ function renderExpirySnapshot(d) {
     return ax < ay ? -1 : ax > ay ? 1 : 0;
   });
   const EXP_HEAD = 3;  // 默认只展开最近到期的 3 个账号，其余收纳成一行
+  /* 「最近到期」这一格分两层（用户反馈：旧版日期 / 随后 N 批 / 7 天内合计 三行
+     同字号同颜色，主次分不出来）：
+       第一行 = 日期（加大加粗）+「（明天到期）」+「7 天内合计 N」，
+       第二行 = 后续批次索引，只给日期与剩余量，弱化到 --ink-3 / 12px。
+     该批积分与日均需耗本来就有独立列，这里不再重复一遍；紧急性依旧只由
+     「距到期」列着色，不额外加色点。 */
   const rowOf = ({ a, bs }, hidden) => {
     const first = bs[0];
     const days = expDayDiff(first.date);
     const daily = Math.ceil(first.remain / Math.max(1, days));
     const week = bs.filter(b => expDayDiff(b.date) <= 7).reduce((s, b) => s + b.remain, 0);
     const color = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
-    const rest = bs.slice(1, 4).map(b =>
-      '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
-    const sub = (rest ? '<div class="note">' + rest + '</div>' : '') +
-      (week > first.remain ? '<div class="note">7 天内合计 ' + fmtTok(week) + '</div>' : '');
+    const when = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const head = '<div class="exp-first">' +
+      '<span class="exp-date">' + esc(first.date) + '</span>' +
+      '<span class="exp-days">（' + when + '）</span>' +
+      (week > first.remain ? '<span class="exp-week">7 天内合计 <b>' + fmtTok(week) + '</b></span>' : '') +
+      '</div>';
+    const rest = bs.slice(1, 4).map(b => '<span>随后 ' + esc(b.date.slice(5)) + ' · ' +
+      fmtTok(b.remain) + '</span>').join('');
+    const more = bs.length > 4 ? '<span>等 ' + bs.length + ' 批</span>' : '';
     return '<tr' + (hidden ? ' data-exp-row="rest" hidden' : '') + '>' +
       '<td>' + esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</td>' +
-      '<td>' + esc(first.date) + sub + '</td>' +
+      '<td>' + head +
+        (rest ? '<div class="exp-batches">' + rest + more + '</div>' : '') + '</td>' +
       '<td class="num" style="color:' + color + '">' +
         (days === 0 ? '今天' : days === 1 ? '明天' : days + ' 天') + '</td>' +
       '<td class="num">' + fmtTok(first.remain) + '</td>' +
@@ -5390,6 +5420,10 @@ if ($('btnEventClearFilters')) $('btnEventClearFilters').onclick = () => {
   if ($('eventFilterModel')) $('eventFilterModel').value = '';
   if ($('eventFilterAccount')) $('eventFilterAccount').value = '';
   if ($('eventFilterStatus')) $('eventFilterStatus').value = '';
+  // 记住的状态也是「筛选条件」的一部分（issue #160 引入的偏好）：只清下拉不清偏好，
+  // 下次打开页面 / reload 时会把「错误」重新选回去，用户以为清除筛选没生效。
+  // 模型 / 来源两项本来就不落盘（每次按归档重建选项），无需处理。
+  prefSet('eventStatus', '');
   renderEventTable();
 };
 if ($('btnEventRefresh')) $('btnEventRefresh').onclick = loadEvents;
