@@ -100,6 +100,10 @@ type Config struct {
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
+	// HeadKeepalive 等上游首帧期间的 SSE 注释帧间隔（server.head_keepalive）。
+	// 0 = 关闭（回到「首帧否决窗口内零字节」的旧行为）。见 headkeepalive.go。
+	HeadKeepalive time.Duration
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -564,6 +568,18 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	}
 	if mi.IsDefault {
 		entry["is_default"] = true
+	}
+	// 限时优惠（上游 modelPromotions）：credits 是**牌价**，promo_* 是当前生效折扣。
+	// 这两个字段原先只在 /panel/api/models 里透出，OpenAI 兼容端点看不到——而第三方
+	// 启动器/客户端恰恰只读 /v1/models 来判断「这个模型现在是不是免费」（issue #203）。
+	// 口径与面板一致：PromoFactor 为 nil 表示上游没给可计算的折扣（例如「错峰使用」
+	// 只有标签没有系数），此时不写 promo_factor，但仍写标签。
+	if mi.PromoFactor != nil {
+		entry["promo_factor"] = *mi.PromoFactor
+		entry["promo_credits"] = mi.PromoCredits
+	}
+	if mi.PromoLabel != "" {
+		entry["promo_label"] = mi.PromoLabel
 	}
 	if mi.SupportsImages {
 		entry["supports_images"] = true // 多模态能力透出
@@ -1047,6 +1063,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// routeModel：映射请求显示真实路由名（别名 INFO 行已记录 客户端名 -> 真实名，
 	// 两行合看即全链路；流水行与账本/上游口径一致，运维排查不用做心算翻译）。
 	st := newChatStat(time.Now(), routeModel, peek.Stream, h.budget)
+	// 等上游首帧期间向客户端补 SSE 注释帧（见 headkeepalive.go）：大上下文 TTFB
+	// 可达 3~6 秒，而 StreamHint 首帧否决窗口内一个字节都不写，客户端会把它当
+	// 「连接僵死」自行放弃（线上实测四次零内容中断全落在 3.46~4.09s）。
+	// 放在轮转循环之前：选号/建请求这段空窗也一起覆盖；写过注释后响应头已提交，
+	// 后续错误由 writeOpenAIError* 的「已提交」分支降级成协议内 error 帧。
+	if h.cfg.HeadKeepalive > 0 && peek.Stream {
+		hk := newHeadKeepaliveWriter(r.Context(), w, h.cfg.HeadKeepalive)
+		if hk != nil {
+			w = hk
+			defer hk.stop()
+		}
+	}
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -2456,6 +2484,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			modelReason = s
 		}
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
+			// 额度窗口登记（pool/window.go）：上游按**首次请求**起算新一轮配额窗口，
+			// 到点没有请求进来窗口就不开始——额度一直空转，下一条真实请求来的时候
+			// 起点才被动落到那一刻。冷却只做到「允许请求进来」，不做「让窗口开始」。
+			// 登记后由 scheduler 的窗口探针在重置时刻发一个最小请求把起点钉住。
+			//
+			// 只在 model != "" 时登记：没有模型名（账号级 429）时窗口键无从构造，而
+			// 账号级冷却的语义本来就与配额窗口无关。
+			if modelRateLimited && model != "" {
+				h.cfg.Pool.ScheduleModelWindow(uid, model, resetAt, !upstream.IsModelBusy(body), time.Now())
+			}
 			if modelRateLimited {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, modelReason)
 				return
@@ -2658,6 +2696,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(status, "api_error", code, msg, "")
+		return
+	}
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
@@ -2678,6 +2720,10 @@ const wafCooldownBase = 60 * time.Second
 // error.gateway_hint（hint 为空串时不带字段——未覆盖形态不编造）。
 // message 仍是上游原文透传（hint 只做并列补充，绝不替换/包装 message）。
 func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(status, "api_error", code, msg, hint)
+		return
+	}
 	if hint == "" {
 		writeOpenAIError(w, status, code, msg)
 		return
@@ -2696,6 +2742,10 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 // （OpenAI 自身 quota 错误的字段口径，客户端按 type 或 code 任一即可识别「不是限流、
 // 重试无意义」）。message 照旧装上游原文或自有文案。
 func writeOpenAIQuotaError(w http.ResponseWriter, msg, hint string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(http.StatusTooManyRequests, "insufficient_quota", "insufficient_quota", msg, hint)
+		return
+	}
 	e := map[string]any{
 		"message": msg,
 		"type":    "insufficient_quota",
@@ -2713,6 +2763,10 @@ func writeOpenAIQuotaError(w http.ResponseWriter, msg, hint string) {
 // 写成 "insufficient_quota" 字符串会让它既认不出配额也认不出业务码。
 // type 仍标 insufficient_quota：OpenAI 口径里这就是「别重试，去等额度」。
 func writeModelQuotaError(w http.ResponseWriter, code int, msg, hint string) {
+	if k, ok := w.(*headKeepaliveWriter); ok && k.Committed() {
+		k.writeErrorFrame(http.StatusTooManyRequests, "insufficient_quota", strconv.Itoa(code), msg, hint)
+		return
+	}
 	e := map[string]any{
 		"message": msg,
 		"type":    "insufficient_quota",

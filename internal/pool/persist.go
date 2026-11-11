@@ -143,6 +143,7 @@ func (p *Pool) load() {
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
+	p.loadWindowsLocked(sf.Windows, time.Now())
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -275,7 +276,9 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 }
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
+	p.windows = nil
 	p.applyAccountsLocked(s.Accounts)
+	p.loadWindowsLocked(s.Windows, time.Now())
 }
 
 // saveLocked 落盘当前状态（调用方须持 p.mu）。返回是否成功：调用方在"先清 dirty
@@ -406,5 +409,6 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		}
 		sf.Accounts[uid] = s
 	}
+	sf.Windows = p.windowsStateLocked(now)
 	return sf
 }

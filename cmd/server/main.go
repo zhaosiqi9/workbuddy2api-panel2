@@ -367,6 +367,9 @@ func main() {
 	case cfg.TaskSweepInterval > 0:
 		log.Printf("补领清扫：每 %s（只 accept 待接受的、只 claim 已达标未领的）", cfg.TaskSweepInterval)
 	}
+	if !cfg.Schedule.WindowProbeEnabled {
+		log.Printf("额度窗口探针已禁用（schedule.window_probe_enabled=false）")
+	}
 	if cfg.Schedule.BalanceRefreshJitterPermill > 0 {
 		log.Printf("周期抖动（人味化）：余额刷新 ±%d‰（账号遍历同步摊开）、补领清扫 ±%d‰，不再精确固定间隔（schedule.*_jitter_permill）",
 			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
@@ -438,10 +441,7 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
-	updateManager := updater.New(appVersion, appRepository, *cfgPath, updater.Settings{
-		AutoEnabled: cfg.Update.AutoEnabled,
-		AutoTime:    cfg.Update.AutoTime,
-	})
+	updateManager := updater.New(appVersion, appRepository, *cfgPath, updateSettingsFrom(cfg))
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		Pool:       p,
@@ -479,10 +479,7 @@ func main() {
 				return nil, err
 			}
 			if saved, loadErr := Load(*cfgPath); loadErr == nil {
-				updateManager.Configure(updater.Settings{
-					AutoEnabled: saved.Update.AutoEnabled,
-					AutoTime:    saved.Update.AutoTime,
-				})
+				updateManager.Configure(updateSettingsFrom(saved))
 			} else if loadErr != nil {
 				log.Printf("WARN: reload update settings: %v", loadErr)
 			}
@@ -573,6 +570,8 @@ func main() {
 		// 入站请求体 OOM 护栏 + 11140 连坐暂停（两处都只在启动时读，改完需重启）。
 		MaxPayloadBytes: cfg.Server.MaxPayloadBytes,
 		RestrictionHold: time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
+		// 等上游首帧期间的 SSE 注释帧间隔（server.head_keepalive，缺省 1.5s）。
+		HeadKeepalive: cfg.HeadKeepaliveDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -586,6 +585,11 @@ func main() {
 	defer func() { stopProxies(); <-proxyDone }()
 	updateManager.SetRestart(stop)
 	go updateManager.Run(ctx)
+	// 账号目录热重载（issue #199）：外部同步进来的 auths/*.json 不必重启进程即可入池，
+	// 删文件也会在连续 N 次扫描确认后出池。面板「刷新」按钮之外还提供
+	// POST /panel/api/accounts/reload 给脚本用；间隔 0s 时只保留手动接口。
+	pn.SetReloadConfig(cfg.ReloadIntervalDur, cfg.Accounts.ReloadDeleteConfirm)
+	go pn.ReloadLoop(ctx.Done())
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
 	if err := pn.StartTaskJobs(ctx, stateSibling(cfg.StateFile, "task-jobs.json")); err != nil {
 		p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退
@@ -598,6 +602,12 @@ func main() {
 	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 额度窗口探针：上游按首次请求起算额度窗口，429 重置时刻到了没人发请求窗口就
+	// 不开始（额度空转）。到点主动发一个最小请求把起点钉住。开关见
+	// schedule.window_probe_enabled（缺省开）。
+	if cfg.Schedule.WindowProbeEnabled {
+		sch.StartModelWindowProbe(ctx)
+	}
 	if cfg.Alerting.Enabled {
 		mon := alert.New(alert.Config{
 			Enabled:          true,
@@ -822,6 +832,28 @@ func effortPolicyOf(cfg *Config) *upstream.EffortPolicy {
 		ClientPriority: cfg.Thinking.ClientPriority,
 		OverrideScope:  cfg.Thinking.OverrideScope,
 		ModelDefaults:  cfg.Thinking.ModelDefaults,
+	}
+}
+
+// updateSettingsFrom 把 config 的 update 段翻成 updater.Settings（issue #198）。
+//
+// 单独抽成函数是因为「启动装配」与「配置保存后热更新」两处必须用同一口 IO——
+// 各写一份字面量时，新增字段必然只接一处（热更新丢了 proxy/mirror，面板看着
+// 保存成功、实际还是旧通道）。
+//
+// proxy_from_env 在 config 里是 *bool：JSON 缺键 = 未表态 → 沿用环境变量（历史
+// 行为，也是绝大多数部署的实际形态）；显式 false 才完全不读环境。
+func updateSettingsFrom(u *Config) updater.Settings {
+	fromEnv := true
+	if u.Update.ProxyFromEnv != nil {
+		fromEnv = *u.Update.ProxyFromEnv
+	}
+	return updater.Settings{
+		AutoEnabled:  u.Update.AutoEnabled,
+		AutoTime:     u.Update.AutoTime,
+		Proxy:        u.Update.Proxy,
+		ProxyFromEnv: fromEnv,
+		Mirror:       u.Update.Mirror,
 	}
 }
 

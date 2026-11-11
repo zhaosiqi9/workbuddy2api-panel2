@@ -44,7 +44,33 @@ type Config struct {
 		AutoEnabled bool `json:"auto_enabled"`
 		// AutoTime 自动更新时间，格式 HH:MM（Asia/Shanghai）。
 		AutoTime string `json:"auto_time"`
+		// Proxy 更新走哪个出口（issue #198，可热生效）：空 = 不显式设置；
+		// 支持 http:// / https:// / socks5://。出站被墙、api.github.com 通而
+		// release-assets 不通时填这里（或 mirror）。
+		Proxy string `json:"proxy"`
+		// ProxyFromEnv 是否沿用进程环境变量里的 HTTP(S)_PROXY（默认 true）。
+		// 设为 false 时只看 proxy 字段——容器里环境变量被别处塞了值、但更新
+		// 需要走另一条通道时用。
+		ProxyFromEnv *bool `json:"proxy_from_env"`
+		// Mirror 资产下载镜像前缀（issue #198），例如 https://ghfast.top/。
+		// 只作用于**资产下载**：Release 元数据（tag/digest/size）永远直连
+		// api.github.com，校验口径不变，镜像无法投毒。空 = 直连。
+		Mirror string `json:"mirror"`
 	} `json:"update"`
+
+	Accounts struct {
+		// ReloadInterval 账号目录热重载轮询间隔（issue #199）。空 = 默认 10s；
+		// "0s" = 关闭轮询（手动接口 POST /panel/api/accounts/reload 仍然可用）。
+		//
+		// 为什么默认开启：外部脚本/另一台机器往 auths/ 同步文件是最常见用法，
+		// 而重启进程会丢在途请求。轮询只读 ReadDir + 少量解析，几十个号的目录
+		// 是微秒级开销。
+		ReloadInterval string `json:"reload_interval"`
+		// ReloadDeleteConfirm 文件消失后要连续几轮扫描确认才把账号移出池（默认 2）。
+		// 半写文件、临时移走文件都可能让账号「这一轮看不见」；剔除会写进 state.json，
+		// 下次启动也不复活，所以要连续确认。1 = 立即删（不建议）。
+		ReloadDeleteConfirm int `json:"reload_delete_confirm"`
+	} `json:"accounts"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -92,6 +118,10 @@ type Config struct {
 		// 时限）。长流式 SSE 合法时长可达分钟级，固定 5s 必然把在途请求掐成
 		// 连接重置。缺省 "30s"；"0" = 不等待直接退。改动需重启进程。
 		ShutdownTimeout string `json:"shutdown_timeout"`
+		// HeadKeepalive 等上游首帧期间向客户端补 SSE 注释帧的间隔。
+		// 缺省 "1500ms"；"0" = 关闭（回到首帧否决窗口内零字节的旧行为）。
+		// 改动需重启进程。
+		HeadKeepalive string `json:"head_keepalive"`
 		// MaxPayloadBytes 入站请求体安全上限（字节），缺省 67108864（64 MiB）。
 		// 这不是「大请求预拦截」：旧的 8 MB 紧上限因为多图/长会话被移除过（大请求
 		// 交上游自然响应）。这里只挡「大到能把进程读死」的上传——读体是 io.ReadAll
@@ -195,6 +225,15 @@ type Config struct {
 		// 「无卡/无断点/数据异常一律跳过，绝不瞎补」）。这里默认不动既有行为，
 		// 想保守的部署把它设成 1 即可——两轮之间还有次日签到，急不来。
 		MakeupCardsPerRound int `json:"makeup_cards_per_round"` // 缺省 0（不限）；>0 = 每轮上限
+
+		// 额度窗口探针（pool/window.go + scheduler/windowprobe.go）：上游 429 带
+		// 「将在 … 重置」时登记窗口，到点主动发一个最小请求，把新一轮额度窗口的
+		// 计时起点钉在重置那一刻。
+		//
+		// 为什么需要：上游按**首次请求**起算窗口。重置时刻到了却没人发请求，窗口就
+		// 不开始，额度一直空转；等下一条真实请求进来，起点落到那一刻，中间那段额度
+		// 白扔。关闭后行为回到「只解除冷却、不主动起窗」。
+		WindowProbeEnabled bool `json:"window_probe_enabled"` // 缺省 true；false = 关闭
 	} `json:"schedule"`
 
 	Global struct {
@@ -520,8 +559,12 @@ type Config struct {
 	BalanceWindowDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// HeadKeepaliveDur 解析后的首帧心跳间隔（缺省 1.5s，0 = 关闭）。
+	HeadKeepaliveDur time.Duration `json:"-"`
 	// ShutdownTimeoutDur 解析后的优雅关停窗口；0 = 不等待在途请求直接退。
 	ShutdownTimeoutDur time.Duration `json:"-"`
+	// ReloadIntervalDur 解析后的账号目录轮询间隔（issue #199）；0 = 关闭轮询。
+	ReloadIntervalDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -542,6 +585,9 @@ func Default() *Config {
 	c.Upstream.RestrictionHoldSeconds = 1800
 	c.Panel.PackageDetailLimit = 5
 	c.Update.AutoTime = "04:00"
+	// 账号目录热重载（issue #199）：默认 10s 轮询、连续 2 次确认才删。
+	c.Accounts.ReloadInterval = "10s"
+	c.Accounts.ReloadDeleteConfirm = 2
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -569,6 +615,7 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	c.Schedule.WindowProbeEnabled = true
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -975,6 +1022,17 @@ func (c *Config) normalize() error {
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
 	}
+	// 首帧心跳间隔：空回落 1.5s（等上游首帧期间补 SSE 注释帧，见 headkeepalive.go）；
+	// "0" 合法（关闭，回到零字节旧行为）；负值 fail fast。
+	if c.Server.HeadKeepalive == "" {
+		c.Server.HeadKeepalive = "1500ms"
+	}
+	if c.HeadKeepaliveDur, err = time.ParseDuration(c.Server.HeadKeepalive); err != nil {
+		return fmt.Errorf("server.head_keepalive: %q %w", c.Server.HeadKeepalive, err)
+	}
+	if c.HeadKeepaliveDur < 0 {
+		return fmt.Errorf("server.head_keepalive: 负时长 %q 无意义", c.Server.HeadKeepalive)
+	}
 	// 优雅关停窗口：空回落 30s（分钟级在途 SSE 远比旧固定 5s 常见）；"0" 合法
 	//（立即退）；负值 fail fast。
 	if c.Server.ShutdownTimeout == "" {
@@ -1047,6 +1105,20 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 账号目录热重载轮询（issue #199）。空值回落默认 10s；"0s" 是合法值（关闭），
+	// 负值钳 0 同关闭（"-5s" 无合理语义）。
+	if c.Accounts.ReloadInterval == "" {
+		c.Accounts.ReloadInterval = "10s"
+	}
+	if c.ReloadIntervalDur, err = time.ParseDuration(c.Accounts.ReloadInterval); err != nil {
+		return fmt.Errorf("accounts.reload_interval: %w", err)
+	}
+	if c.ReloadIntervalDur < 0 {
+		c.ReloadIntervalDur = 0
+	}
+	if c.Accounts.ReloadDeleteConfirm <= 0 {
+		c.Accounts.ReloadDeleteConfirm = 2
 	}
 	// 窗口用量调度窗口（issue #112）：空值回落默认 1h；"0" 合法（关停）；负值钳 0。
 	if c.Pool.BalanceWindow == "" {
