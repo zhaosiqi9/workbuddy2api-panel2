@@ -319,6 +319,9 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ProxyExitLookup 代理健康探测时经该代理查一次出口画像（国家 / 住宅或机房 / ISP，
+		// proxypool/intel.go），缺省 false，热生效。每个节点每 6 小时一次第三方请求（ip-api 免费档仅明文 HTTP）。
+		ProxyExitLookup bool `json:"proxy_exit_lookup"`
 		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
 		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
 		SanitizeBrandScope string `json:"sanitize_brand_scope"`
@@ -344,6 +347,30 @@ type Config struct {
 		// 1%），所以不适合当默认行为。关闭时端点回 403 watermark_strip_disabled，
 		// MCP 工具不出现在 tools/list 里。面板保存后经 livecfg 热生效。
 		WatermarkStripEnabled bool `json:"watermark_strip_enabled"`
+
+		// ThreeDEnabled 混元 3D 生成（POST /v1/3d/* 与 MCP 工具 generate_3d /
+		// get_3d_task）的总开关，默认 false。
+		//
+		// 打开后凭证由 ThreeDAutoToken 自动签发（用账号自己的 access token 调官方
+		// /v2/api-keys 换 ck_t_，协议见 internal/upstream/three_d_credential.go），
+		// 不再需要手工收集凭证。关闭时端点回 403 three_d_disabled，
+		// MCP 工具不出现在 tools/list 里。
+		ThreeDEnabled bool `json:"three_d_enabled"`
+
+		// ThreeDTempTokens 手工配置的 `ck_t_` 临时云凭证，键 = 账号 UID，特殊键 "*"
+		// 作为兜底（不区分账号的凭证）。见 internal/upstream/three_d_credential.go。
+		//
+		// 敏感字段：只进内存，不写日志、不回显到面板、不进错误信息。作为自动签发的
+		// **手工覆盖**：填了的账号直接用这份凭证，不再签发；留空 = 全走自动签发。
+		ThreeDTempTokens map[string]string `json:"three_d_temp_tokens"`
+
+		// ThreeDAutoToken 自动签发临时云凭证（默认 true）：打开 3D 后网关用已登录
+		// 账号自己的 access token 调官方 /v2/api-keys 换 ck_t_（官方客户端
+		// connect_cloud_service 同款协议，2026-11-14 真机验证），按账号缓存到过期前，
+		// 上游 401/403 拒绝时自动重签。静态 API Key 账号（ck_/pt_ 前缀）没有 OAuth
+		// 身份签不出来，会自动跳过并回 503。显式 false 可退回「只用手工凭证表」。
+		// 改动需重启生效。
+		ThreeDAutoToken bool `json:"three_d_auto_token"`
 	} `json:"features"`
 
 	Models struct {
@@ -635,6 +662,9 @@ func Default() *Config {
 	// 缺省等一轮（60s 上限），避免把上游明说「40 秒后再来」的排队秒变成客户端可见失败。
 	c.Features.BusyRetry = true
 	c.Features.BusyWaitSeconds = 60
+	// 3D 临时凭证自动签发缺省 true：打开 three_d_enabled 即开箱可用，无须手工收集
+	// ck_t_。显式 false 退回「只用手工凭证表」。
+	c.Features.ThreeDAutoToken = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
 	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
@@ -1017,8 +1047,13 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
-		c.Logging.PanelLogEnabled = true
+	}
+	// 面板日志的回落与请求归档各管各的：request_archive_max_mb<=0 不能顺手把
+	// panel_log_enabled 的显式 false 改回 true（false 是合法取值，不回落）。
+	if c.Logging.PanelLogRetentionDays <= 0 {
 		c.Logging.PanelLogRetentionDays = 7
+	}
+	if c.Logging.PanelLogMaxMB <= 0 {
 		c.Logging.PanelLogMaxMB = 50
 	}
 	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；

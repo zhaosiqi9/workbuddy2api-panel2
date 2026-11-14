@@ -47,10 +47,15 @@ type Auth struct {
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
 
-	// wbSealed 源文件里原本是 $wbEncrypted 信封的字段（"auth.accessToken" 形态）：
-	// SaveAtomic 回写时必须逐个复原成信封，否则刷新后的 token 会以明文覆盖掉
-	// 桌面端的加密文件。nil = 来源文件没加密。
-	wbSealed map[string]bool
+	// 来源文件是新版桌面端的 $wbEncrypted 加密形态（见 wbencrypted.go）时才非零：
+	//   - wbSealed：原本是信封的字段路径（"auth.accessToken" / 扁平形 "accessToken"）；
+	//   - wbDoc：解密后的整份文档。SaveAtomic 以它为底回写，桌面端自己的字段（phoneNumber、
+	//     uin 等）与原有形态（嵌套/扁平）都保留，再按 wbSealed 复原信封；
+	//   - expiresAtMillis：来源的 expiresAt 是毫秒（桌面端口径）。内存里统一用秒，回写换回毫秒。
+	// 只在 Parse 里写，之后只读。
+	wbSealed        map[string]bool
+	wbDoc           map[string]any
+	expiresAtMillis bool
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -365,7 +370,7 @@ func Parse(raw []byte) (*Auth, error) {
 	}
 	// 新版桌面端把 auth 字段换成 $wbEncrypted 信封（见 wbencrypted.go）。
 	// 解密后再按原两形态解析；未加密文件原样返回，不吃这条路径。
-	dec, sealed, err := decryptWBEncrypted(raw)
+	dec, sealed, wbDoc, err := decryptWBEncrypted(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -436,8 +441,11 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	rawExpires := a.ExpiresAt
 	a.ExpiresAt = normalizeExpiresAt(a.ExpiresAt)
-	a.wbSealed = sealed
+	if len(sealed) > 0 {
+		a.wbSealed, a.wbDoc, a.expiresAtMillis = sealed, wbDoc, a.ExpiresAt != rawExpires
+	}
 	return &a, nil
 }
 
@@ -474,29 +482,34 @@ func (a *Auth) SaveAtomic() error {
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
-	doc := map[string]any{
-		"auth": map[string]any{
-			"accessToken":  a.AccessToken,
-			"refreshToken": a.RefreshToken,
-			"expiresAt":    a.ExpiresAt,
-			"domain":       a.Domain,
-			"realm":        a.realm,
-		},
-		"account": map[string]any{
-			"uid":          a.UID,
-			"enterpriseId": a.EnterpriseID,
-			"nickname":     a.Nickname,
-		},
-	}
-	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
-	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
-	if a.DeviceToken != "" {
-		doc["device_token"] = a.DeviceToken
-	}
-	// 来源文件加密的，回写也保持加密：按读入时的信封清单复原（见 sealForSave）。
-	// 封装失败就拒绝落盘——明文降级覆盖加密文件比写不进去更糟。
-	if err := sealForSave(doc, a.wbSealed); err != nil {
-		return err
+	var doc map[string]any
+	if len(a.wbSealed) > 0 {
+		// 来源是桌面端的加密文件：以解密后的原文档为底回写，再按读入时的信封清单复原
+		// （见 sealForSave）。封装失败就拒绝落盘——明文覆盖加密文件比写不进去更糟。
+		doc = a.wbOverlayLocked()
+		if err := sealForSave(doc, a.wbSealed); err != nil {
+			return err
+		}
+	} else {
+		doc = map[string]any{
+			"auth": map[string]any{
+				"accessToken":  a.AccessToken,
+				"refreshToken": a.RefreshToken,
+				"expiresAt":    a.ExpiresAt,
+				"domain":       a.Domain,
+				"realm":        a.realm,
+			},
+			"account": map[string]any{
+				"uid":          a.UID,
+				"enterpriseId": a.EnterpriseID,
+				"nickname":     a.Nickname,
+			},
+		}
+		// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
+		// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
+		if a.DeviceToken != "" {
+			doc["device_token"] = a.DeviceToken
+		}
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -519,6 +532,61 @@ func (a *Auth) SaveAtomic() error {
 	return nil
 }
 
+// wbOverlayLocked 加密来源文件的回写底稿：解密后原文档的副本，把本包管理的字段写回它们
+// 原来的位置（嵌套形在 auth / account 下，扁平形在顶层）。原文没有、值又为空的字段不新增，
+// 其余桌面端字段原样保留；expiresAt 按来源的单位写回。调用方持 a.mu。
+func (a *Auth) wbOverlayLocked() map[string]any {
+	doc := cloneJSON(a.wbDoc).(map[string]any)
+	authObj, nested := doc["auth"].(map[string]any)
+	accObj := doc
+	if nested {
+		if accObj, _ = doc["account"].(map[string]any); accObj == nil {
+			accObj = map[string]any{}
+			doc["account"] = accObj
+		}
+	} else {
+		authObj = doc
+	}
+	set := func(m map[string]any, k string, v any, empty bool) {
+		if _, has := m[k]; has || !empty {
+			m[k] = v
+		}
+	}
+	exp := a.ExpiresAt
+	if a.expiresAtMillis {
+		exp *= 1000
+	}
+	set(authObj, "accessToken", a.AccessToken, false)
+	set(authObj, "refreshToken", a.RefreshToken, a.RefreshToken == "")
+	set(authObj, "expiresAt", exp, a.ExpiresAt == 0)
+	set(authObj, "domain", a.Domain, a.Domain == "")
+	set(authObj, "realm", a.realm, a.realm == "")
+	set(accObj, "uid", a.UID, a.UID == "")
+	set(accObj, "enterpriseId", a.EnterpriseID, a.EnterpriseID == "")
+	set(accObj, "nickname", a.Nickname, a.Nickname == "")
+	set(doc, "device_token", a.DeviceToken, a.DeviceToken == "")
+	return doc
+}
+
+// cloneJSON 深拷贝 JSON 解码出的值（map / slice 递归，其余是不可变的标量）。
+func cloneJSON(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(t))
+		for k, x := range t {
+			m[k] = cloneJSON(x)
+		}
+		return m
+	case []any:
+		s := make([]any, len(t))
+		for i, x := range t {
+			s[i] = cloneJSON(x)
+		}
+		return s
+	}
+	return v
+}
+
 // SaveAtomicRetry 在 SaveAtomic 基础上做有界重试（0/100ms/300ms）。
 //
 // 为什么需要：refresh 成功后上游已经轮换了 RT，新 token 只在内存里；如果这一次
@@ -536,6 +604,39 @@ func (a *Auth) SaveAtomicRetry() error {
 		}
 	}
 	return err
+}
+
+// AdoptNewer 用 src（同一账号从磁盘新读出的凭证）原地更新 a，仅当 src 的令牌更新时才动。
+// 返回是否更新。
+//
+// 为什么原地改而不是换指针：池里的 *Auth 被在途请求与令牌刷新共享，刷新在 a.mu 内原地
+// 写新令牌。换成一个从文件读出的新对象有两种坏结果：扫描早于刷新写回时，新对象带的是
+// 已被轮换作废的 refresh token；刷新还在旧对象上进行时，结果写进了没人用的对象。
+// 所以只在锁内、只在磁盘上的令牌更新（过期时刻更晚，典型为外部重新登录）时拷字段。
+// 过期时刻都为 0 的静态 API Key 以令牌不同为准。
+func (a *Auth) AdoptNewer(src *Auth) bool {
+	if a == src {
+		return false
+	}
+	src.mu.Lock()
+	in := Auth{
+		AccessToken: src.AccessToken, RefreshToken: src.RefreshToken, ExpiresAt: src.ExpiresAt,
+		Domain: src.Domain, realm: src.realm, EnterpriseID: src.EnterpriseID,
+		Nickname: src.Nickname, DeviceToken: src.DeviceToken, wbSealed: src.wbSealed,
+	}
+	src.mu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if in.AccessToken == "" || in.AccessToken == a.AccessToken {
+		return false
+	}
+	if in.ExpiresAt <= a.ExpiresAt && !(in.ExpiresAt == 0 && a.ExpiresAt == 0) {
+		return false
+	}
+	a.AccessToken, a.RefreshToken, a.ExpiresAt = in.AccessToken, in.RefreshToken, in.ExpiresAt
+	a.Domain, a.realm, a.EnterpriseID = in.Domain, in.realm, in.EnterpriseID
+	a.Nickname, a.DeviceToken, a.wbSealed = in.Nickname, in.DeviceToken, in.wbSealed
+	return true
 }
 
 // LoadReport 一次账号目录扫描的结果。
@@ -562,10 +663,19 @@ func LoadDir(dir string) ([]*Auth, error) {
 }
 
 // LoadDirReport 同 LoadDir，另外回报文件数与解析失败的条目（热重载用来判断能否删号）。
+//
+// 目录不存在视为空目录；其余读目录错误（挂载掉了、权限丢了）原样返回。filepath.Glob 会把
+// 这类 I/O 错误吞成「0 个文件」，热重载随后就把整个池删光，所以这里改用 os.ReadDir。
 func LoadDirReport(dir string) (LoadReport, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
-	if err != nil {
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return LoadReport{}, err
+	}
+	var files []string
+	for _, e := range entries {
+		if ok, _ := filepath.Match("workbuddy*.json", e.Name()); ok && !e.IsDir() {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
 	}
 	report := LoadReport{Files: len(files)}
 	// 按 mtime 升序：同一个号的轮转备份并存时（客户端会写 <name>.<ts>.<pid>.<uuid>.info），
@@ -612,16 +722,25 @@ func LoadDirReport(dir string) (LoadReport, error) {
 				logfmt.Label(a.UID, a.Nickname), prev.file, prev.eid, f, a.EnterpriseID)
 		}
 		seenUID[a.UID] = dupUID{file: f, eid: a.EnterpriseID}
-		if a.RealmStored() == "" {
-			if changed, r := a.BackfillRealm(); changed {
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
-				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
-				}
+		out = append(out, a)
+	}
+	// 只给每个 uid 胜出的那份（mtime 最新、最后载入）做 realm 迁移落盘：给落败的旧文件写盘会
+	// 刷新它的 mtime，下次启动它就成了「最新」，胜负来回翻。
+	winner := make(map[string]*Auth, len(out))
+	for _, a := range out {
+		winner[a.UID] = a
+	}
+	for _, a := range out {
+		if winner[a.UID] != a || a.RealmStored() != "" {
+			continue
+		}
+		if changed, r := a.BackfillRealm(); changed {
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
+			} else if r == "global" {
+				log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
 			}
 		}
-		out = append(out, a)
 	}
 	report.Auths = out
 	return report, nil

@@ -504,6 +504,12 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+// IsProviderOverloaded 报告 body 是否为 11134「模型供应商暂时不可用」。它与 6020/6021
+// 同归 ErrUpstreamBusy，但成因是供应商过载而不是排队：给客户端的文案要区分（队列满的
+// 措辞会让人去查排队），而且供应商过载时「换个模型」是有效出路，排队时不是。
+// 只认结构化 code，文案单独出现仍是普通 5xx。
+func IsProviderOverloaded(body string) bool { return hasBusinessCode(body, "11134") }
+
 // parseQueueRetryAfter 从排队/容量信封的 body 抽上游明示的重试等待时长。
 // 两种形态都认（整数秒，超 retryAfterSanity 按异常值封顶）：
 //
@@ -713,7 +719,7 @@ func Classify(status int, body string) ErrKind {
 	// vs 换号 0–12%）。
 	// 归 ErrUpstreamBusy = 不罚号 + body 侧解析 retry_policy.retry_after 后不轮转，
 	// 与 6020/6021 同一族（上游容量信号，自带重试口径）。
-	if hasBusinessCode(body, "11134") {
+	if IsProviderOverloaded(body) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -909,7 +915,7 @@ type Client struct {
 	exclusive map[string]map[string]bool
 	// paidByUID 各账号「是不是付费号」（billing summary 的 IsPaidUser）。只在拿到
 	// 该字段时写入（目前只有 global 的 summary 给）；缺条目 = 不知道。
-	paidMu   sync.RWMutex
+	paidMu    sync.RWMutex
 	paidByUID map[string]bool
 
 	// globalModels 缓存 global 模型目录探测结果（1h TTL + 5min 负缓存；
@@ -983,6 +989,11 @@ type Client struct {
 	// modelBusyUnsupported 上游 /v2/chat/busy 在该域不存在（国际版实测 404）。探到一次即置位，
 	// 本进程后续跳过探测（见 modelbusy.go）。atomic：并发调用只读+一次性写。
 	modelBusyUnsupported atomic.Bool
+
+	// ThreeDCredential 混元 3D 的 `ck_t_` 临时云凭证来源（见 three_d_credential.go）。
+	// nil = 拿不到凭证 → 3D 一律回 503，不发请求。启动期挂载；凭证内容不进日志、
+	// 不进错误串、不落盘。
+	ThreeDCredential ThreeDCredential
 }
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
@@ -2516,6 +2527,16 @@ func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
 	c.modelMaxOut[realmKey(realm)] = m
 }
 
+// StoreModelMaxOutForTest 跨包测试钩子：直接写入某域的模型输出上限快照（真实路径由
+// FetchModels 刷新目录时写入）。仅测试引用。
+func (c *Client) StoreModelMaxOutForTest(realm string, maxOut map[string]int64) {
+	infos := make([]ModelInfo, 0, len(maxOut))
+	for id, n := range maxOut {
+		infos = append(infos, ModelInfo{ID: id, MaxTokens: n})
+	}
+	c.storeModelMaxOut(realm, infos)
+}
+
 // modelMaxOutSnapshot 返回输出上限快照副本；nil 表示未知（不补默认，行为同旧路径）。
 func (c *Client) modelMaxOutSnapshot(realm string) map[string]int64 {
 	c.effortsMu.RLock()
@@ -3254,12 +3275,7 @@ func IsAlreadyCheckin(err error) bool {
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
-		}
-	}
-	return false
+	return isAlreadyCheckinMsg(ue.Msg)
 }
 
 func truncate(s string, n int) string {

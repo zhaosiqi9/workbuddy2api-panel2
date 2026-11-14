@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -156,8 +157,12 @@ func (c *Client) webJSON(ctx context.Context, a *auth.Auth, method, url string, 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// 网页通道的失败**不进 pool 冷却状态机**：它是每日活跃的旁路调用，与 chat
 		// 通道的账号健康无关（同 /v1/models 拉取失败不 NoteError 的理由）。故这里用
-		// 普通 error 而不是 *Error——后者会被上层当成账号级信号去做冷却/禁号。
-		return fmt.Errorf("web %s %s: HTTP %d: %s", method, url, resp.StatusCode, truncate(string(raw), 160))
+		// webCodeError 而不是 *Error——后者会被上层当成账号级信号去做冷却/禁号。
+		var env struct {
+			Code int `json:"code"`
+		}
+		_ = json.Unmarshal(raw, &env) // 非 2xx 的响应体也常带业务码；解不出就是 0
+		return &webCodeError{Code: env.Code, msg: fmt.Sprintf("web %s %s: HTTP %d: %s", method, url, resp.StatusCode, truncate(string(raw), 160))}
 	}
 	if out == nil {
 		return nil
@@ -171,7 +176,7 @@ func (c *Client) webJSON(ctx context.Context, a *auth.Auth, method, url string, 
 		return fmt.Errorf("web %s %s parse: %w", method, url, err)
 	}
 	if env.Code != 0 {
-		return fmt.Errorf("web %s %s: code=%d msg=%s", method, url, env.Code, env.Msg)
+		return &webCodeError{Code: env.Code, msg: fmt.Sprintf("web %s %s: code=%d msg=%s", method, url, env.Code, env.Msg)}
 	}
 	if len(env.Data) == 0 {
 		return nil
@@ -269,10 +274,21 @@ func (c *Client) DeleteWebConversation(ctx context.Context, a *auth.Auth, id str
 	return c.webConversationAction(ctx, a, id, "delete")
 }
 
+// webCodeError 网页通道的业务失败：信封 code != 0，或非 2xx 响应体里带的业务码（解不出为 0）。
+type webCodeError struct {
+	Code int
+	msg  string
+}
+
+func (e *webCodeError) Error() string { return e.msg }
+
 // IsWebConversationLimit 判定建会话被「活跃会话已达上限」拒绝（code 10105）。
 // 上游对单账号同时存在的活跃会话有硬上限（webActiveConversationLimit 条）。
+// 按业务码判，不在错误文本里找子串：URL、requestId、上游原文里出现 10105 都会误判，
+// 误判的代价是停掉账号上的活跃会话。
 func IsWebConversationLimit(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "10105")
+	var we *webCodeError
+	return errors.As(err, &we) && we.Code == 10105
 }
 
 // WebConversationRow 会话列表里的一条（只取清理要用的字段）。
@@ -379,6 +395,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 	// 读 SSE：只统计，不解析 update 内容（打卡不关心说了什么）。
 	// 流结束（或 ctx 取消）时 goroutine 自然退出，不阻塞主流程。
 	done := make(chan struct{})
+	var events, chunks int
 	go func() {
 		defer close(done)
 		sc := bufio.NewScanner(stream.Body)
@@ -405,16 +422,21 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 			}
 			switch msg.Method {
 			case "session/update":
-				res.Events++
+				events++
 				if msg.Params.Update.SessionUpdate == "agent_message_chunk" {
-					res.Chunks++
+					chunks++
 				}
 			case "session/endTurn":
-				res.Events++
+				events++
 			}
 		}
 	}()
 
+	finish := func(result WebTurnResult, err error) (WebTurnResult, error) {
+		<-done
+		result.Events, result.Chunks = events, chunks
+		return result, err
+	}
 	rpc := func(rid int, method string, params any) error {
 		return c.acpPost(ctx, a, sess, connID, rid, method, params)
 	}
@@ -425,12 +447,12 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 			"terminal": false,
 		},
 	}); err != nil {
-		return res, fmt.Errorf("acp initialize: %w", err)
+		return finish(res, fmt.Errorf("acp initialize: %w", err))
 	}
 	if err := rpc(2, "session/load", map[string]any{
 		"sessionId": sess.SessionID, "cwd": sess.Cwd, "mcpServers": []any{},
 	}); err != nil {
-		return res, fmt.Errorf("acp session/load: %w", err)
+		return finish(res, fmt.Errorf("acp session/load: %w", err))
 	}
 	// session/set_model 是 ACP 扩展方法，**非致命**：失败时这一轮仍会跑完，只是
 	// 可能落到账号默认档（国际版默认 Auto，按付费模型计费）——所以失败要能看到
@@ -442,7 +464,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 		"sessionId": sess.SessionID,
 		"prompt":    []map[string]string{{"type": "text", "text": prompt}},
 	}); err != nil {
-		return res, fmt.Errorf("acp session/prompt: %w", err)
+		return finish(res, fmt.Errorf("acp session/prompt: %w", err))
 	}
 
 	// 轮询到 completed：上游跑完这一轮才会把状态从 working 改掉。
@@ -454,20 +476,20 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 			switch strings.ToLower(st) {
 			case "completed":
 				res.Elapsed = time.Since(started)
-				return res, nil
+				return finish(res, nil)
 			case "failed", "error", "deleted":
 				res.Elapsed = time.Since(started)
-				return res, fmt.Errorf("web conversation status=%s", st)
+				return finish(res, fmt.Errorf("web conversation status=%s", st))
 			}
 		}
 		if time.Now().After(deadline) {
 			res.Elapsed = time.Since(started)
-			return res, fmt.Errorf("web conversation 在 %s 内没有跑完（status=%s）", webTurnTimeout, res.Status)
+			return finish(res, fmt.Errorf("web conversation 在 %s 内没有跑完（status=%s）", webTurnTimeout, res.Status))
 		}
 		select {
 		case <-ctx.Done():
 			res.Elapsed = time.Since(started)
-			return res, ctx.Err()
+			return finish(res, ctx.Err())
 		case <-time.After(webPollInterval):
 		}
 	}
