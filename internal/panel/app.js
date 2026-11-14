@@ -366,6 +366,25 @@ function disabledKind(reason) {
 // 为什么余额趋势要标：这张表每一行是一条**历史余额曲线**，它不会因为账号被封
 // 而消失——但读者不知道「这条线为什么从某天起不再更新」，会把「号被封了」误读成
 // 「这段时间没怎么用」。标出来才对得上。
+// bhColorOf 余额趋势统一取色：失效账号一律用灰线，且**不占色板序号**。
+//
+// 两个要点：
+//  1. 失效号用灰 —— 与表格里 bh-dead 行的去色一致，图上也不能让死号的颜色
+//     和活号一样鲜；它已经不再更新，艳丽的线会误导人以为「还在跑」。
+//  2. 灰线**不参与色板轮转** —— 否则某个健康号会因前面多了一个死号而换色，
+//     同一账号在不同时间/不同域下颜色飘移，读者对不上。
+
+// bhIsDead 该账号当前是否已失效（禁用）。暂停**不算** —— 暂停号照常保号、
+// 余额仍在更新，只是暂不接流量，图上应按活号正常着色。
+function bhIsDead(s) {
+  const a = acctStateOf(s && s.uid);
+  return !!(a && a.disabled);
+}
+
+function bhColorOf(uid, colorIndex, isDead) {
+  if (isDead) return 'var(--ink-3)';
+  return BH_COLORS[colorIndex % BH_COLORS.length];
+}
 function acctStateOf(uid) {
   const list = (overviewData && overviewData.accounts) || [];
   return list.find(a => a && a.uid === uid) || null;
@@ -2224,9 +2243,8 @@ function startAddLogin() {
       $('addQr').innerHTML = qrSVG(M, (M.length + 8) * 4);
       $('addQr').hidden = false;
     } catch (e) {
-      // shortcut: 编码器到 v6（134 字节）为止；装了 CODEBUDDY_LOGIN_DEVICE_NONCE 的
-      // workbuddy 站链接 157 字节编不出来，再往上要补版本信息块，那时再升 v8。
-      // 但降级必须说出来 —— 静默不显示二维码会被当成 bug 反复报。
+      // shortcut: 编码器到 v9（230 字节）为止；更长只可能是部署侧塞了超长 nonce，
+      // 那时退回只显示链接。降级必须说出来 —— 静默不显示二维码会被当成 bug 反复报。
       $('addQr').innerHTML = '<span class="note">链接过长，无法生成二维码，请用下方「复制链接」或「在浏览器打开」</span>';
       $('addQr').hidden = false;
     }
@@ -4237,9 +4255,9 @@ const gmul = (a, b) => (a && b) ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0;
 // 各版本参数（下标 = 版本-1）：[数据码字总数, 每块纠错码字数, 块数]，ECC L。
 // v1-5 单块（免交织）；v6 两块相等各 68 数据字。授权链接约 108 字节，v5 上限 106
 // 差两个字节，正好卡在版本边界上，所以必须补 v6。
-const QR_V = [[19, 7, 1], [34, 10, 1], [55, 15, 1], [80, 20, 1], [108, 26, 1], [136, 18, 2]];
+const QR_V = [[19, 7, 1], [34, 10, 1], [55, 15, 1], [80, 20, 1], [108, 26, 1], [136, 18, 2], [156, 20, 2], [194, 24, 2], [232, 30, 2]];
 // 对齐图案中心坐标（v2+；与定位图案重叠的位置在放置时跳过）
-const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34]];
+const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46]];
 const QR_MASK = (r, c) => (r + c) % 2 === 0; // 掩码模式 0
 
 // 生成多项式（最高次系数在前，g[0] 恒为 1）
@@ -4313,10 +4331,13 @@ function qrMatrix(text) {
   // 校正图形（仅贯穿两定位图案之间：8..n-9，不得覆盖定位图案本体）
   for (let r = 8; r <= n - 9; r++) setF(r, 6, r % 2 === 0);
   for (let c = 8; c <= n - 9; c++) setF(6, c, c % 2 === 0);
-  // 对齐图案（v2+，跳过与定位重叠处）
+  // 对齐图案（v2+，只跳过与三个定位图案重叠的位置；v7+ 的中心会落在贯穿线上，
+  // 那时按 F 判定会整块漏掉，所以判据只看是否压到定位图案的 9×9 区域）
   const align = QR_ALIGN[ver - 1] || [];
+  const hitsFinder = (r, c) =>
+    (r <= 8 && c <= 8) || (r <= 8 && c >= n - 9) || (r >= n - 9 && c <= 8);
   for (const ar of align) for (const ac of align) {
-    if (F[ar][ac]) continue;
+    if (hitsFinder(ar, ac)) continue;
     for (let r = -2; r <= 2; r++) for (let c = -2; c <= 2; c++)
       setF(ar + r, ac + c, Math.max(Math.abs(r), Math.abs(c)) !== 1);
   }
@@ -4338,6 +4359,18 @@ function qrMatrix(text) {
   for (let i = 9; i <= 14; i++) setF(8, 14 - i, !!fb(i));
   // 暗模块（恒为深色，位于副本一垂直段末端）
   setF(n - 8, 8, true);
+  // 版本信息块（v7+ 必填，18 位 BCH(6,18) 多项式 0x1F25，两份副本：
+  // 右上 6×3 与左下转置位置）。低版本没有这块，多写会破坏数据区。
+  if (ver >= 7) {
+    let vi = ver << 12;
+    for (let i = 17; i >= 12; i--) if ((vi >> i) & 1) vi ^= 0x1F25 << (i - 12);
+    vi = (ver << 12) | (vi & 0xFFF);
+    for (let i = 0; i < 18; i++) {
+      const bit = ((vi >> i) & 1) === 1;
+      setF((i / 3) | 0, n - 11 + i % 3, bit);
+      setF(n - 11 + i % 3, (i / 3) | 0, bit);
+    }
+  }
 
   // 数据码字 + 纠错码字 → 位流
   const dcw = qrDataCodewords(text, dataCap);
@@ -4758,8 +4791,11 @@ function renderBalanceChart(series) {
       '" text-anchor="' + (i === 0 ? 'start' : i === tickCount - 1 ? 'end' : 'middle') + '">' + esc(fmtT(t)) + '</text>';
   }
 
+  // 色板序号只按**健康系列**推进：失效号用灰线但不占号，避免健康号换色。
+  let liveIdx = 0;
   rows.forEach((s, si) => {
-    const color = BH_COLORS[si % BH_COLORS.length];
+    const dead = bhIsDead(s);
+    const color = bhColorOf(s.uid, dead ? 0 : liveIdx++, dead);
     const pts = s.points.map(p => ({ x: X(Number(p.t) * 1000), y: Y(Number(p.c)), c: Number(p.c), t: Number(p.t) * 1000, g: p.d }));
     // 平滑 <path>（monotone，不过冲 —— 见 smoothPath 注释）+ 统一线宽/线帽。
     // 线宽按**本图系列数**取档，两处折线共用同一函数，风格不会各走各的。
@@ -4908,13 +4944,21 @@ function renderDailyBars(series) {
     out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' +
       (v > 0 ? '+' : '') + fmtNum(Math.round(v)) + '</text>';
   }
+  // 色板序号只按健康系列推进，与折线同一口径（见 bhColorOf 注释）——
+  // 否则同一账号在两张图上颜色不同。
+  const barColor = new Map();
+  let barLive = 0;
+  series.forEach(s => {
+    const dead = bhIsDead(s);
+    barColor.set(s.uid, bhColorOf(s.uid, dead ? 0 : barLive++, dead));
+  });
   // 每日一组柱
   days.forEach((day, di) => {
     const gx = PL + di * groupW;
     series.forEach((s, si) => {
       const v = (map.get(s.uid) || {})[day];
       if (v === undefined) return;
-      const color = BH_COLORS[si % BH_COLORS.length];
+      const color = barColor.get(s.uid) || 'var(--ink-3)';
       // 组内柱之间留 1px 缝：无缝隙时相邻两柱会被知觉成一个整体
       // （格式塔共边界效应），看不出"两根独立的柱"。
       const gap = nAcc > 1 ? 1 : 0;
@@ -5162,9 +5206,18 @@ async function loadBalance() {
       bhRealm = pickRealm(all);
     }
     renderRealmSeg(all);
-    const rows = filterRealm(all, bhRealm);
-    renderBalanceChart(rows);
-    renderDailyBars(rows);
+    // 失效账号（禁用）**不参与统计**，但保留记录单独列出。
+    //
+    // 为什么分开：禁用号的余额是历史残留（人已不能干活），混进「当前合计 / 净变化 /
+    // 消耗到账」会把死钱算成活钱，运维据此判断容量必然高估。但历史曲线本身有诊断
+    // 价值（能看出「哪天开始不更新」），所以不是删掉，而是移出统计区单独陈列。
+    // 暂停号不受影响：它照常保号、余额仍会更新，只是暂不接流量。
+    const inRealm = filterRealm(all, bhRealm);
+    const isDead = s => { const a = acctStateOf(s.uid); return !!(a && a.disabled); };
+    const rows = inRealm.filter(s => !isDead(s));
+    const deadRows = inRealm.filter(isDead);
+    renderBalanceChart(inRealm);  // 折线画全部：失效号用灰线保留历史轨迹（表格才做统计剔除）
+    renderDailyBars(inRealm);    // 同上：柱子也画全，灰线/灰柱表示已失效
     // 分域小计：同域内可加（语义成立）；**不做跨域总计**——cn 与 global 的
     // 积分不同源、不可互换，相加得出的数没有意义（见 BH_REALMS 注释）。
     let total = 0, delta = 0;
@@ -5184,8 +5237,8 @@ async function loadBalance() {
       bhCard('窗口净变化', (delta > 0 ? '+' : '') + fmtNum(delta), delta > 0 ? 'ok' : delta < 0 ? 'bad' : '') +
       bhCard('采样点数', fmtNum(rows.reduce((a, s) => a + (s.points || []).length, 0)));
     const tb = $('bhAccBody');
-    if (tb) tb.innerHTML = rows.length ? rows.map((s, i) =>
-      '<tr><td class="mark"><i class="dot" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i></td>' +
+    const renderRow = (s, i, dead) =>
+      '<tr' + (dead ? ' class="bh-dead"' : '') + '><td class="mark"><i class="dot" style="background:' + bhColorOf(s.uid, i, dead) + '"></i></td>' +
       (() => {
         const a = acctStateOf(s.uid);
         // 账号已禁用/暂停：名字后加小标签。曲线仍展示（历史数据有意义），
@@ -5213,7 +5266,14 @@ async function loadBalance() {
                fmtFlowCell(t, mo, 'consumed', days) +
                fmtFlowCell(t, mo, 'gained', days);
       })() +
-      '<td class="num">' + (s.points || []).length + '</td></tr>').join('')
+      '<td class="num">' + (s.points || []).length + '</td></tr>';
+
+    const deadHtml = deadRows.length
+      ? '<tr class="bh-sep"><td colspan="11">已失效 ' + deadRows.length + ' 个（不计入上方统计，仅保留历史记录）</td></tr>' +
+        deadRows.map((s, i) => renderRow(s, rows.length + i, true)).join('')
+      : '';
+    const liveHtml = rows.map((s, i) => renderRow(s, i, false)).join('');
+    if (tb) tb.innerHTML = (rows.length + deadRows.length) ? (liveHtml + deadHtml)
       : '<tr><td colspan="11"><div class="empty"><div class="big">该域暂无采样</div>' +
         '切到其他域，或等待下一次余额刷新</div></td></tr>';
     renderBalanceFoot(rows, d.now, days);
