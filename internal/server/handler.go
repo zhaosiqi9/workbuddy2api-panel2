@@ -122,6 +122,9 @@ type Config struct {
 	// 默认不落盘。热生效，经 livecfg 快照。
 	RecordContext bool
 
+	// TTSEnabled / ASREnabled 官方语音端点的静态回退（features.tts_enabled / asr_enabled）。
+	TTSEnabled bool
+	ASREnabled bool
 	// EmbeddingsEnabled 实验特性 /v1/embeddings 开关的静态回退（features.embeddings_enabled）。
 	// Live 非 nil 时以热快照为准；裸用/单测路径用本字段。
 	EmbeddingsEnabled bool
@@ -153,6 +156,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		APIKey:                h.cfg.APIKey,
 		SoftCooldown:          h.cfg.SoftCooldown,
 		EmbeddingsEnabled:     h.cfg.EmbeddingsEnabled,
+		TTSEnabled:            h.cfg.TTSEnabled,
+		ASREnabled:            h.cfg.ASREnabled,
 		WatermarkStripEnabled: h.cfg.WatermarkStripEnabled,
 		ThreeDEnabled:         h.cfg.ThreeDEnabled,
 		RecordClientInfo:      h.cfg.RecordClientInfo,
@@ -317,6 +322,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/embeddings", h.withAuth(h.embeddings))
 	// 实验特性：水印裁切（features.watermark_strip_enabled，默认关闭；关着时回 403）。
 	h.mux.HandleFunc("POST /v1/images/strip-watermark", h.withAuth(h.watermarkStrip))
+	// 实验特性：官方语音端点（features.tts_enabled / asr_enabled，默认关闭；关着时回 403）。
+	// 协议来自官方桌面端包的静态反查（见 upstream/speech.go 文件头），已用真号跑通 TTS→ASR。
+	h.mux.HandleFunc("POST /v1/audio/speech", h.withAuth(h.speech))
+	h.mux.HandleFunc("POST /v1/audio/transcriptions", h.withAuth(h.transcriptions))
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
 	// Claude Code 上下文将满时会调官方计数端点，上游没有对应接口，这里本地估算
@@ -377,7 +386,8 @@ func isChatEntry(path string) bool {
 		"/v1/images/generations", "/v1/images/edits",
 		"/v1/videos", "/v1/videos/generations", "/v1/videos/tasks",
 		"/v1/3d/generations", "/v1/3d/tasks",
-		"/v1/search", "/v1/fetch", "/v1/tools/search", "/v1/tools/fetch", "/v1/embeddings":
+		"/v1/search", "/v1/fetch", "/v1/tools/search", "/v1/tools/fetch", "/v1/embeddings",
+		"/v1/audio/speech", "/v1/audio/transcriptions":
 		return true
 	}
 	return false
@@ -2894,11 +2904,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
 		if kind == upstream.ErrClient {
 			// 15021 = edgebrowser 的**域名路由策略**拒绝（"domain rejected by via
-			// routing policy"）：域名级判定，同一域名的所有账号返回完全一致的 403，
-			// 与账号健康无关。喂连败会让「连续抓几个 Google 文档」把整个 CN 池逐个
-			// 降到出池（5 次达阈）——这不是账号的问题，故与 ErrContentBlocked 同待遇：
-			// 零动作（/v1/fetch 另有跨域兜底，见 fetch.go）。
-			if upstream.HasCodeMarker(body, "15021") {
+			// routing policy"），15022 = 上游浏览器连不上目标站（ERR_CONNECTION_REFUSED）：
+			// 两者都是域名/边缘级判定，同一 URL 的所有账号返回完全一致的报文，与账号
+			// 健康无关。喂连败会让「连续抓几个 Google 文档」把整个 CN 池逐个降到出池
+			// （5 次达阈）——这不是账号的问题，故与 ErrContentBlocked 同待遇：
+			// 零动作（/v1/fetch 另有换域兜底，见 fetch.go）。
+			if upstream.HasCodeMarker(body, "15021") || upstream.HasCodeMarker(body, "15022") {
 				return
 			}
 			h.cfg.Pool.NoteFailures(uid)
